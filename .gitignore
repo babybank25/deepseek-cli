@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local runtime data (contains auth/session/cookies)
+runs/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Local DeepSeek CLI state
+.deepseek_cli/
+
+# Local backups and scratch files
+backup/
+*.log
+
