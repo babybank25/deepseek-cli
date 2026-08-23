@@ -4,6 +4,8 @@ NetworkSniffer — Playwright-based browser traffic interceptor.
 Launches a persistent Chromium browser, hooks all XHR/fetch requests,
 and provides heuristics to identify the DeepSeek chat completion endpoint.
 """
+import importlib.util
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -20,16 +22,33 @@ try:
         Request,
         Response,
     )
-    try:
-        from playwright_stealth import stealth_async
-        HAS_STEALTH = True
-    except ImportError:
-        HAS_STEALTH = False
 except ImportError:
     async_playwright = None  # type: ignore[assignment]
-    HAS_STEALTH = False
+    BrowserContext = Page = Request = Response = object  # type: ignore[misc,assignment]
+
+# Detect availability without importing playwright-stealth at module import time.
+# v1.0.6 imports deprecated pkg_resources, and this project intentionally treats
+# warnings as errors during tests. The optional dependency is loaded only when a
+# real browser starts, inside a tightly scoped warning filter below.
+HAS_STEALTH = importlib.util.find_spec("playwright_stealth") is not None
 
 console = Console()
+
+
+async def _apply_stealth(page: Page) -> None:
+    if not HAS_STEALTH:
+        return
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"pkg_resources is deprecated as an API.*",
+                category=DeprecationWarning,
+            )
+            from playwright_stealth import stealth_async
+        await stealth_async(page)
+    except ImportError:
+        return
 
 
 class NetworkSniffer:
@@ -74,8 +93,7 @@ class NetworkSniffer:
         )
         self.page = await self.context.new_page()
 
-        if HAS_STEALTH:
-            await stealth_async(self.page)
+        await _apply_stealth(self.page)
 
         self.page.on("request", self._on_request)
         self.page.on("response", self._on_response)
