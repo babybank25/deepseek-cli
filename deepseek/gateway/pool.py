@@ -1,22 +1,4 @@
-"""Smart account pool with per-account locking, scoring, and failover.
-
-Design goals
-------------
-* **Concurrency**: requests on different accounts run in parallel (the
-  pool itself is NOT a single global lock — only per-account locks).
-* **Smart selection**: pick the available account with the fewest recent
-  errors, breaking ties by oldest ``last_used`` plus a small jitter so
-  the load balances even when stats are equal.
-* **Robust failover**: on quota errors, mark the account exhausted with
-  exponential backoff and try the next available one. On auth errors,
-  propagate immediately. On transient network errors, the underlying
-  ``APIClient`` already retries — anything that escapes is treated as
-  fatal for this attempt and the account is rotated.
-* **Persisted state**: ``stats.json`` records cooldowns and counters so a
-  server restart doesn't lose track of which accounts are exhausted.
-
-The pool is safe to call from many concurrent requests.
-"""
+"""Smart multi-account routing with persistent conversation affinity."""
 from __future__ import annotations
 
 import asyncio
@@ -27,25 +9,23 @@ import random
 import time
 from typing import AsyncGenerator, Callable, Optional
 
+from ..client import APIClient
 from ..constants import CONFIG_DIR
 from ..exceptions import AuthExpiredError
 from ..models import APIConfig
 from .account import Account
+from .bindings import ConversationBinding, ConversationBindingStore
 from .store import AccountStore
 
 logger = logging.getLogger(__name__)
 
-Token = tuple[str, str]  # (type, text)
-
+Token = tuple[str, str]
 STATS_FILE = CONFIG_DIR / "pool_stats.json"
-ACQUIRE_TIMEOUT_SECONDS = 90.0  # max wait for any account to become free
+ACQUIRE_TIMEOUT_SECONDS = 90.0
 
 
 class NoAccountAvailableError(RuntimeError):
-    """Raised when no account is available (all locked or all exhausted).
-
-    Carries an optional ``retry_after`` (seconds) for HTTP 503 responses.
-    """
+    """Raised when no safe account is available for a request."""
 
     def __init__(self, message: str, retry_after: Optional[float] = None) -> None:
         super().__init__(message)
@@ -53,21 +33,21 @@ class NoAccountAvailableError(RuntimeError):
 
 
 class AccountPool:
-    """Pool of DeepSeek accounts with per-account locking and smart routing."""
+    """Route requests while keeping each conversation on one account/session."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        binding_store: Optional[ConversationBindingStore] = None,
+    ) -> None:
         self._accounts: list[Account] = []
-        self._registry_lock = asyncio.Lock()  # only protects _accounts mutations
-        self._last_persist_at: float = 0.0
-        # Persist successful-request stats at most once per this many seconds
-        # to avoid thrashing the disk under high QPS. Critical events
-        # (cooldowns, auth) bypass the throttle.
-        self._persist_min_interval: float = 5.0
+        self._registry_lock = asyncio.Lock()
+        self._last_persist_at = 0.0
+        self._persist_min_interval = 5.0
+        self._bindings = binding_store or ConversationBindingStore()
 
-    # ── Loading & persistence ─────────────────────────────────
+    # ── Loading and persistence ───────────────────────────────
 
     def load_all(self) -> int:
-        """Load all accounts from disk + restore prior cooldown state."""
         names = AccountStore.list_accounts()
         self._accounts = []
         for name in names:
@@ -76,6 +56,7 @@ class AccountPool:
                 self._accounts.append(Account(name=name, config=cfg))
                 logger.info("Loaded account: %s", name)
         self._restore_stats()
+        self._bindings.reload({account.name for account in self._accounts})
         return len(self._accounts)
 
     def _restore_stats(self) -> None:
@@ -86,31 +67,24 @@ class AccountPool:
         except (OSError, json.JSONDecodeError):
             return
         for acc in self._accounts:
-            s = data.get(acc.name)
-            if not isinstance(s, dict):
+            state = data.get(acc.name)
+            if not isinstance(state, dict):
                 continue
-            # Only restore cooldown if it's still in the future.
             try:
-                eu = float(s.get("exhausted_until") or 0)
-                if eu > time.time():
-                    acc.exhausted_until = eu
-                acc.consecutive_quota_hits = int(s.get("consecutive_quota_hits") or 0)
-                acc.total_requests = int(s.get("total_requests") or 0)
-                acc.total_errors = int(s.get("total_errors") or 0)
-                acc.last_used = float(s.get("last_used") or 0)
-                acc.last_error = s.get("last_error")
+                exhausted_until = float(state.get("exhausted_until") or 0)
+                if exhausted_until > time.time():
+                    acc.exhausted_until = exhausted_until
+                acc.consecutive_quota_hits = int(
+                    state.get("consecutive_quota_hits") or 0
+                )
+                acc.total_requests = int(state.get("total_requests") or 0)
+                acc.total_errors = int(state.get("total_errors") or 0)
+                acc.last_used = float(state.get("last_used") or 0)
+                acc.last_error = state.get("last_error")
             except (TypeError, ValueError):
                 continue
 
     def _persist_stats(self) -> None:
-        """Write current stats to disk. Best-effort; failures are silent.
-
-        Synchronous I/O on a small JSON file (~few KB). Called from async
-        contexts after each request — typical write latency on a local
-        filesystem is sub-millisecond, so we don't bother off-loading to a
-        thread pool. If profiling shows this is a hot path on slow disks,
-        wrap the body in ``await asyncio.to_thread(...)``.
-        """
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             data = {
@@ -129,14 +103,13 @@ class AccountPool:
             tmp.replace(STATS_FILE)
             self._last_persist_at = time.monotonic()
         except OSError:
-            pass  # stats are best-effort
+            pass
 
     def flush_stats(self) -> None:
-        """Public flush hook so admin endpoints can persist after edits."""
         self._persist_stats()
+        self._bindings.flush()
 
     def _maybe_persist_stats(self) -> None:
-        """Throttled persist: skipped if we wrote within the last N seconds."""
         now = time.monotonic()
         if now - self._last_persist_at < self._persist_min_interval:
             return
@@ -157,53 +130,81 @@ class AccountPool:
             target = next((a for a in self._accounts if a.name == name), None)
             if target is not None:
                 self._accounts = [a for a in self._accounts if a.name != name]
+        self._bindings.delete_account(name)
         if target is not None:
             await target.close()
         return AccountStore.delete(name)
 
     def available_accounts(self) -> list[Account]:
-        return [a for a in self._accounts if a.is_available]
+        return [account for account in self._accounts if account.is_available]
 
     @property
     def accounts(self) -> list[Account]:
-        """Read-only snapshot of all accounts. Use this from outside the pool."""
         return list(self._accounts)
 
     def is_empty(self) -> bool:
         return not self._accounts
 
-    # ── Test seam ─────────────────────────────────────────────
-
     def _replace_accounts_for_test(self, accounts: list[Account]) -> None:
-        """White-box hook so tests can install a custom account list without
-        going through the disk-backed loader. Not part of the public API."""
         self._accounts = list(accounts)
 
     # ── Selection ─────────────────────────────────────────────
 
     def _score(self, acc: Account) -> tuple:
-        """Lower score = more attractive. Tie-broken by jitter for fairness."""
         return (
-            1 if acc.lock.locked() else 0,    # prefer idle
-            acc.consecutive_quota_hits,        # prefer healthier
-            acc.total_errors,                  # prefer fewer total errors
-            acc.last_used,                     # prefer least recently used
-            random.random(),                   # jitter
+            1 if acc.lock.locked() else 0,
+            acc.consecutive_quota_hits,
+            acc.total_errors,
+            acc.last_used,
+            random.random(),
         )
 
     def _pick(self, exclude: set[str]) -> Optional[Account]:
-        """Pick the most attractive available account not in ``exclude``."""
         candidates = [
-            a for a in self._accounts
-            if a.is_available and a.name not in exclude
+            account
+            for account in self._accounts
+            if account.is_available and account.name not in exclude
         ]
-        if not candidates:
-            return None
-        return min(candidates, key=self._score)
+        return min(candidates, key=self._score) if candidates else None
 
     def _next_account(self) -> Optional[Account]:
-        """Backward-compat helper for tests; uses scoring without exclusion."""
-        return self._pick(exclude=set())
+        return self._pick(set())
+
+    def _account_by_name(self, name: str) -> Optional[Account]:
+        return next((account for account in self._accounts if account.name == name), None)
+
+    # ── Conversation lifecycle ────────────────────────────────
+
+    def list_conversations(self) -> list[dict]:
+        return self._bindings.list()
+
+    async def delete_conversation(self, conversation_id: str) -> bool:
+        binding = self._bindings.delete(conversation_id)
+        if binding is None:
+            return False
+        account = self._account_by_name(binding.account_name)
+        if account is not None:
+            await account.drop_conversation(conversation_id)
+        return True
+
+    async def compact_conversation(self, conversation_id: str) -> bool:
+        binding = self._bindings.get(conversation_id)
+        if binding is None:
+            return False
+        account = await self._acquire_bound(binding)
+        try:
+            client = account.client_for(conversation_id, binding)
+            compacted = await client.compact_session()
+            if compacted:
+                self._bindings.update_from_client(
+                    conversation_id,
+                    account.name,
+                    client,
+                )
+            return compacted
+        finally:
+            if account.lock.locked():
+                account.lock.release()
 
     # ── Streaming ─────────────────────────────────────────────
 
@@ -212,136 +213,186 @@ class AccountPool:
         message: str,
         *,
         request_id: Optional[str] = None,
+        conversation_id: Optional[str] = None,
         model_preset: Optional[dict] = None,
         file_ids: Optional[list[str]] = None,
+        reset_session: bool = False,
         on_account_chosen: Optional[Callable[[Account], None]] = None,
+        on_client_chosen: Optional[Callable[[Account, APIClient], None]] = None,
     ) -> AsyncGenerator[Token, None]:
-        """Send a message via the smartest available account.
+        """Send through a healthy account without silently migrating a conversation.
 
-        Yields ``(type, text)`` tokens. On quota-class errors, retries on
-        the next available account. On auth/fatal errors, propagates.
-
-        ``model_preset`` and ``file_ids`` are applied to the chosen account
-        UNDER its lock, so concurrent requests can't trample each other's
-        in-flight settings. Preset is a dict like
-        ``{"model_type": "expert", "thinking_enabled": True, "search_enabled": False}``.
-
-        ``on_account_chosen`` (optional) is invoked synchronously with the
-        ``Account`` object once the pool has acquired its lock and is about
-        to forward the message. Lets callers correlate request → account
-        for headers like ``X-Account-Used`` or post-stream inspection of
-        ``client._just_compacted``.
-
-        Raises:
-            NoAccountAvailableError: when the pool is empty or all accounts
-                are exhausted/in-use beyond the acquire timeout.
-            AuthExpiredError: on hard auth failures (caller must re-auth).
+        New conversations may fail over before any output is emitted. Once a
+        conversation has a persisted binding, quota or availability failures are
+        surfaced instead of moving it to another account and losing context.
         """
-        rid = request_id or f"req_{int(time.time()*1000)}"
+        rid = request_id or f"req_{int(time.time() * 1000)}"
+        binding = self._bindings.get(conversation_id)
         excluded: set[str] = set()
-        any_account_seen = False
 
         while True:
-            acc = await self._acquire_account(excluded)
-            any_account_seen = True
+            was_bound = binding is not None
+            if binding is not None:
+                account = await self._acquire_bound(binding)
+            else:
+                account = await self._acquire_account(excluded)
+
+            client = account.client_for(conversation_id, binding)
             try:
-                # Apply config UNDER the account lock — safe from races
-                if model_preset:
-                    if "model_type" in model_preset:
-                        acc.client.model_type = model_preset["model_type"]
-                    if "thinking_enabled" in model_preset:
-                        acc.client.thinking_enabled = model_preset["thinking_enabled"]
-                    if "search_enabled" in model_preset:
-                        acc.client.search_enabled = model_preset["search_enabled"]
-                    if "auto_compact_threshold" in model_preset:
-                        acc.client.auto_compact_threshold = (
-                            model_preset["auto_compact_threshold"]
-                        )
-                if file_ids:
-                    acc.client.set_pending_files(file_ids)
+                if reset_session:
+                    await client.reset_session()
+                self._apply_request_options(client, model_preset, file_ids)
+                self._notify_choice(
+                    account,
+                    client,
+                    on_account_chosen,
+                    on_client_chosen,
+                )
 
-                if on_account_chosen is not None:
-                    try:
-                        on_account_chosen(acc)
-                    except Exception:
-                        # Caller's callback must never break the request.
-                        logger.exception("on_account_chosen callback raised")
-
-                logger.info("[%s] using account=%s", rid, acc.name)
+                logger.info(
+                    "[%s] using account=%s conversation=%s",
+                    rid,
+                    account.name,
+                    conversation_id or "<stateless>",
+                )
                 streamed_any = False
                 try:
-                    async for token in acc.client.send_message_stream(message):
+                    async for token in client.send_message_stream(message):
                         streamed_any = True
                         yield token
-                    acc.mark_success()
+                    account.mark_success()
+                    if conversation_id:
+                        self._bindings.update_from_client(
+                            conversation_id,
+                            account.name,
+                            client,
+                        )
                     self._maybe_persist_stats()
                     return
                 except AuthExpiredError:
-                    acc.mark_error(Exception("auth expired"))
-                    self._persist_stats()  # auth events: persist immediately
+                    account.mark_error(Exception("auth expired"))
+                    self._persist_stats()
+                    if conversation_id and not was_bound:
+                        await account.drop_conversation(conversation_id)
                     raise
-                except Exception as e:
+                except Exception as error:
                     if streamed_any:
-                        # Already wrote partial output to caller — don't retry
-                        # on a different account, that would duplicate text.
-                        acc.mark_error(e)
+                        account.mark_error(error)
                         self._persist_stats()
                         raise
-                    if acc.is_quota_error(e):
-                        cooldown = acc.mark_exhausted()
-                        acc.last_error = str(e)[:200]
-                        excluded.add(acc.name)
-                        self._persist_stats()  # cooldowns: persist immediately
+                    if account.is_quota_error(error):
+                        cooldown = account.mark_exhausted()
+                        account.last_error = str(error)[:200]
+                        self._persist_stats()
+                        if was_bound:
+                            raise NoAccountAvailableError(
+                                f"Conversation '{conversation_id}' is pinned to "
+                                f"quota-exhausted account '{account.name}'.",
+                                retry_after=cooldown,
+                            ) from error
+                        if conversation_id:
+                            await account.drop_conversation(conversation_id)
+                        excluded.add(account.name)
                         logger.warning(
                             "[%s] %s quota-exhausted (cooldown %ds): %s",
-                            rid, acc.name, int(cooldown), e,
+                            rid,
+                            account.name,
+                            int(cooldown),
+                            error,
                         )
-                        continue  # try next account
-                    # Non-quota, non-auth error → mark + propagate
-                    acc.mark_error(e)
+                        continue
+                    account.mark_error(error)
                     self._persist_stats()
+                    if conversation_id and not was_bound:
+                        await account.drop_conversation(conversation_id)
                     raise
             finally:
-                if acc.lock.locked():
-                    acc.lock.release()
+                if account.lock.locked():
+                    account.lock.release()
 
-            # unreachable
-            break
+    @staticmethod
+    def _apply_request_options(
+        client: APIClient,
+        model_preset: Optional[dict],
+        file_ids: Optional[list[str]],
+    ) -> None:
+        if model_preset:
+            if "model_type" in model_preset:
+                client.model_type = model_preset["model_type"]
+            if "thinking_enabled" in model_preset:
+                client.thinking_enabled = model_preset["thinking_enabled"]
+            if "search_enabled" in model_preset:
+                client.search_enabled = model_preset["search_enabled"]
+            if "auto_compact_threshold" in model_preset:
+                client.auto_compact_threshold = model_preset["auto_compact_threshold"]
+        if file_ids:
+            client.set_pending_files(file_ids)
 
-        if not any_account_seen:
-            raise NoAccountAvailableError("Pool is empty.")
+    @staticmethod
+    def _notify_choice(
+        account: Account,
+        client: APIClient,
+        on_account_chosen: Optional[Callable[[Account], None]],
+        on_client_chosen: Optional[Callable[[Account, APIClient], None]],
+    ) -> None:
+        if on_account_chosen is not None:
+            try:
+                on_account_chosen(account)
+            except Exception:
+                logger.exception("on_account_chosen callback raised")
+        if on_client_chosen is not None:
+            try:
+                on_client_chosen(account, client)
+            except Exception:
+                logger.exception("on_client_chosen callback raised")
+
+    async def _acquire_bound(self, binding: ConversationBinding) -> Account:
+        account = self._account_by_name(binding.account_name)
+        if account is None:
+            raise NoAccountAvailableError(
+                f"Conversation '{binding.conversation_id}' is pinned to missing "
+                f"account '{binding.account_name}'. Start a new conversation."
+            )
+        if not account.is_available:
+            raise NoAccountAvailableError(
+                f"Conversation '{binding.conversation_id}' is pinned to unavailable "
+                f"account '{binding.account_name}'.",
+                retry_after=account.cooldown_remaining,
+            )
+        try:
+            await asyncio.wait_for(
+                account.lock.acquire(),
+                timeout=ACQUIRE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as error:
+            raise NoAccountAvailableError(
+                f"Account '{account.name}' is busy for conversation "
+                f"'{binding.conversation_id}'."
+            ) from error
+        if not account.is_available:
+            account.lock.release()
+            raise NoAccountAvailableError(
+                f"Account '{account.name}' became unavailable.",
+                retry_after=account.cooldown_remaining,
+            )
+        return account
 
     async def _acquire_account(self, excluded: set[str]) -> Account:
-        """Pick + lock an available account. Waits up to the acquire timeout.
-
-        The pool is busy if every available account is currently locked by
-        another request; we poll/wait without blocking the event loop.
-        """
         deadline = time.monotonic() + ACQUIRE_TIMEOUT_SECONDS
         while True:
             if not self._accounts:
                 raise NoAccountAvailableError("No accounts configured in pool.")
-
-            acc = self._pick(excluded)
-            if acc is None:
-                # All available accounts are excluded → quota cascade
+            account = self._pick(excluded)
+            if account is None:
                 self._raise_no_available(excluded)
-
-            # Try to take the lock without blocking the whole pool. If it's
-            # busy, fall back to ``acc.lock.acquire()`` with timeout so the
-            # request waits politely for a free slot.
-            if not acc.lock.locked():
-                await acc.lock.acquire()
-                # Re-check availability under lock (may have changed)
-                if acc.is_available:
-                    return acc
-                # If account became exhausted while we waited, release + retry
-                acc.lock.release()
-                excluded.add(acc.name)
+            assert account is not None
+            if not account.lock.locked():
+                await account.lock.acquire()
+                if account.is_available:
+                    return account
+                account.lock.release()
+                excluded.add(account.name)
                 continue
-
-            # Account is busy — wait briefly, then re-pick (might find a
-            # different idle account that just freed up).
             wait = min(0.25, max(0.05, deadline - time.monotonic()))
             if wait <= 0:
                 self._raise_no_available(excluded)
@@ -350,37 +401,36 @@ class AccountPool:
                 self._raise_no_available(excluded)
 
     def _raise_no_available(self, excluded: set[str]) -> None:
-        # Compute the soonest cooldown end across exhausted accounts.
-        exhausted = [a for a in self._accounts if not a.is_available]
-        retry_after: Optional[float] = None
-        if exhausted:
-            retry_after = min(a.cooldown_remaining for a in exhausted)
+        exhausted = [account for account in self._accounts if not account.is_available]
+        retry_after = (
+            min(account.cooldown_remaining for account in exhausted)
+            if exhausted
+            else None
+        )
         raise NoAccountAvailableError(
             f"All {len(self._accounts)} accounts are quota-exhausted or busy "
             f"(excluded={len(excluded)}). Wait for cooldown or add more accounts.",
             retry_after=retry_after,
         )
 
-    # ── Status ────────────────────────────────────────────────
+    # ── Status and shutdown ───────────────────────────────────
 
     def status(self) -> dict:
         snapshot = list(self._accounts)
-        avail = sum(1 for a in snapshot if a.is_available)
-        in_use = sum(1 for a in snapshot if a.lock.locked())
         return {
             "total_accounts": len(snapshot),
-            "available_accounts": avail,
-            "in_use": in_use,
-            "accounts": [a.to_status_dict() for a in snapshot],
+            "available_accounts": sum(1 for account in snapshot if account.is_available),
+            "in_use": sum(1 for account in snapshot if account.lock.locked()),
+            "active_conversations": len(self._bindings),
+            "accounts": [account.to_status_dict() for account in snapshot],
         }
 
     async def close_all(self) -> None:
-        # Flush any pending stats before tearing down so we never lose
-        # cooldown counters across a graceful restart.
         self._persist_stats()
+        self._bindings.flush()
         async with self._registry_lock:
             accounts = list(self._accounts)
             self._accounts.clear()
-        for acc in accounts:
+        for account in accounts:
             with contextlib.suppress(Exception):
-                await acc.close()
+                await account.close()
