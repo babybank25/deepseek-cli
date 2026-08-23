@@ -44,7 +44,7 @@ class APIConfig:
     session_path: str = "/api/v0/chat_session/create"
     pow_challenge_path: str = "/api/v0/chat/create_pow_challenge"
     pow_worker_url: str = DEFAULT_POW_WORKER_URL
-    config_version: int = 2
+    config_version: int = 1
 
     @classmethod
     def from_dict(cls, data: dict) -> "APIConfig":
@@ -58,7 +58,7 @@ class APIConfig:
         filtered.setdefault("session_path", "/api/v0/chat_session/create")
         filtered.setdefault("pow_challenge_path", "/api/v0/chat/create_pow_challenge")
         filtered.setdefault("pow_worker_url", DEFAULT_POW_WORKER_URL)
-        filtered.setdefault("config_version", 2)
+        filtered.setdefault("config_version", 1)
         return cls(**filtered)
 
     def to_dict(self) -> dict:
