@@ -116,9 +116,11 @@ class AccountPool:
 
     def _maybe_persist_stats(self) -> None:
         now = time.monotonic()
-        if now - self._last_persist_at < self._persist_min_interval:
+        if (
+            self._last_persist_at > 0.0
+            and now - self._last_persist_at < self._persist_min_interval
+        ):
             return
-        self._last_persist_at = now
         self._persist_stats()
 
     async def add_account(self, name: str, config: APIConfig) -> Account:
