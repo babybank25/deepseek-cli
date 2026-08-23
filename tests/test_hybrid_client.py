@@ -7,6 +7,7 @@ from deepseek._client_legacy import APIClient as LegacyAPIClient
 from deepseek.client import APIClient
 from deepseek.exceptions import AuthExpiredError
 from deepseek.models import APIConfig
+from deepseek.protocol import ProtocolCapabilities
 
 
 def _config() -> APIConfig:
@@ -149,6 +150,31 @@ async def test_pow_fails_closed_when_all_solvers_fail(monkeypatch):
     monkeypatch.setattr("deepseek.client.solve_pow_node", lambda _challenge: None)
     with pytest.raises(RuntimeError, match="No compatible DeepSeek PoW solver"):
         await client._generate_pow_token_for_path("/path")
+
+
+@pytest.mark.asyncio
+async def test_missing_pow_challenge_with_stale_auth_raises_auth_error(monkeypatch):
+    client = APIClient(_config())
+
+    async def no_challenge(target_path=None):
+        return None
+
+    client._fetch_pow_challenge = no_challenge  # type: ignore[assignment]
+    stale = ProtocolCapabilities(
+        reachable=True,
+        auth_ok=False,
+        pow_ok=False,
+        pow_algorithm=None,
+        completion_path="/api/v0/chat/completion",
+        session_path="/api/v0/chat_session/create",
+        pow_challenge_path="/api/v0/chat/create_pow_challenge",
+        status_code=403,
+        error="forbidden",
+    )
+    monkeypatch.setattr("deepseek.protocol.probe_protocol", _async_value(stale))
+
+    with pytest.raises(AuthExpiredError):
+        await client._generate_pow_token_for_path("/api/v0/chat/completion")
 
 
 def _async_value(value):

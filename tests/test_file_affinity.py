@@ -70,3 +70,19 @@ async def test_conversation_and_file_account_conflict_fails(tmp_path):
             file_ids=["file-a"],
         ):
             pass
+
+
+@pytest.mark.asyncio
+async def test_unknown_file_id_fails_closed_with_multiple_accounts(tmp_path, monkeypatch):
+    files = FileAffinityStore(path=tmp_path / "files.json")
+    bindings = ConversationBindingStore(path=tmp_path / "bindings.json")
+    pool = AccountPool(binding_store=bindings, file_store=files)
+    pool._replace_accounts_for_test([Account("a0", _config()), Account("a1", _config())])
+
+    async def stream(self, _message):
+        yield ("text", "should-not-route")
+
+    monkeypatch.setattr("deepseek.client.APIClient.send_message_stream", stream)
+    with pytest.raises(NoAccountAvailableError, match="unknown file"):
+        async for _ in pool.send_message_stream("hello", file_ids=["legacy-file"]):
+            pass

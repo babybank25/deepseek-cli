@@ -23,7 +23,7 @@ def _config() -> APIConfig:
     )
 
 
-async def _capture_app(monkeypatch, tmp_path):
+async def _capture_app(monkeypatch, tmp_path, stream_impl=None):
     captured = {}
     monkeypatch.setattr(server_module.SessionManager, "load_config", lambda: _config())
     monkeypatch.setattr(
@@ -37,12 +37,13 @@ async def _capture_app(monkeypatch, tmp_path):
         lambda: ConversationIndex(path=tmp_path / "sessions.json"),
     )
 
-    async def fake_stream(self, _message):
-        self.session_id = self.session_id or "session-test"
-        self.last_message_id = "message-test"
-        yield ("text", "hello from deepseek")
+    if stream_impl is None:
+        async def stream_impl(self, _message):
+            self.session_id = self.session_id or "session-test"
+            self.last_message_id = "message-test"
+            yield ("text", "hello from deepseek")
 
-    monkeypatch.setattr(server_module.APIClient, "send_message_stream", fake_stream)
+    monkeypatch.setattr(server_module.APIClient, "send_message_stream", stream_impl)
 
     import uvicorn
 
@@ -100,6 +101,63 @@ async def test_responses_api_and_previous_response_resume(monkeypatch, tmp_path)
         )
         assert second.status_code == 200
         assert second.json()["conversation"]["id"] == conversation_id
+
+
+@pytest.mark.asyncio
+async def test_previous_response_replays_stateless_tool_history(monkeypatch, tmp_path):
+    prompts = []
+
+    async def fake_stream(self, message):
+        prompts.append(message)
+        if len(prompts) == 1:
+            yield (
+                "text",
+                '<tool_call>{"name":"lookup","arguments":{"city":"Bangkok"}}</tool_call>',
+            )
+        else:
+            yield ("text", "final answer")
+
+    app = await _capture_app(monkeypatch, tmp_path, stream_impl=fake_stream)
+    headers = {"Authorization": "Bearer secret"}
+    with TestClient(app) as client:
+        first = client.post(
+            "/v1/responses",
+            headers=headers,
+            json={
+                "model": "deepseek-chat",
+                "input": "What is the weather?",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "lookup",
+                        "parameters": {"type": "object"},
+                    }
+                ],
+            },
+        )
+        assert first.status_code == 200
+        first_body = first.json()
+        call = next(item for item in first_body["output"] if item["type"] == "function_call")
+
+        second = client.post(
+            "/v1/responses",
+            headers=headers,
+            json={
+                "model": "deepseek-chat",
+                "previous_response_id": first_body["id"],
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": call["call_id"],
+                        "output": "sunny 32C",
+                    }
+                ],
+            },
+        )
+        assert second.status_code == 200
+        assert len(prompts) == 2
+        assert "sunny 32C" in prompts[1]
+        assert "lookup" in prompts[1]
 
 
 @pytest.mark.asyncio
