@@ -1,5 +1,4 @@
 """OpenAI-compatible HTTP server backed by authenticated DeepSeek Web sessions."""
-from __future__ import annotations
 
 import asyncio
 import hmac
