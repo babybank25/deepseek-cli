@@ -1,4 +1,4 @@
-"""Smart multi-account routing with persistent conversation affinity."""
+"""Smart multi-account routing with persistent conversation and file affinity."""
 from __future__ import annotations
 
 import asyncio
@@ -12,13 +12,14 @@ from typing import AsyncGenerator, Callable, Optional
 from ..client import APIClient
 from ..constants import CONFIG_DIR
 from ..exceptions import AuthExpiredError
+from ..metrics import metrics
 from ..models import APIConfig
 from .account import Account
 from .bindings import ConversationBinding, ConversationBindingStore
+from .files import FileAffinityError, FileAffinityStore
 from .store import AccountStore
 
 logger = logging.getLogger(__name__)
-
 Token = tuple[str, str]
 STATS_FILE = CONFIG_DIR / "pool_stats.json"
 ACQUIRE_TIMEOUT_SECONDS = 90.0
@@ -33,30 +34,32 @@ class NoAccountAvailableError(RuntimeError):
 
 
 class AccountPool:
-    """Route requests while keeping each conversation on one account/session."""
+    """Route requests without silently breaking conversation or file lineage."""
 
     def __init__(
         self,
         binding_store: Optional[ConversationBindingStore] = None,
+        file_store: Optional[FileAffinityStore] = None,
     ) -> None:
         self._accounts: list[Account] = []
         self._registry_lock = asyncio.Lock()
         self._last_persist_at = 0.0
         self._persist_min_interval = 5.0
         self._bindings = binding_store or ConversationBindingStore()
-
-    # ── Loading and persistence ───────────────────────────────
+        self._files = file_store or FileAffinityStore()
 
     def load_all(self) -> int:
         names = AccountStore.list_accounts()
         self._accounts = []
         for name in names:
-            cfg = AccountStore.load(name)
-            if cfg:
-                self._accounts.append(Account(name=name, config=cfg))
+            config = AccountStore.load(name)
+            if config:
+                self._accounts.append(Account(name=name, config=config))
                 logger.info("Loaded account: %s", name)
+        valid = {account.name for account in self._accounts}
         self._restore_stats()
-        self._bindings.reload({account.name for account in self._accounts})
+        self._bindings.reload(valid)
+        self._files.reload(valid)
         return len(self._accounts)
 
     def _restore_stats(self) -> None:
@@ -66,21 +69,21 @@ class AccountPool:
             data = json.loads(STATS_FILE.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return
-        for acc in self._accounts:
-            state = data.get(acc.name)
+        for account in self._accounts:
+            state = data.get(account.name)
             if not isinstance(state, dict):
                 continue
             try:
                 exhausted_until = float(state.get("exhausted_until") or 0)
                 if exhausted_until > time.time():
-                    acc.exhausted_until = exhausted_until
-                acc.consecutive_quota_hits = int(
+                    account.exhausted_until = exhausted_until
+                account.consecutive_quota_hits = int(
                     state.get("consecutive_quota_hits") or 0
                 )
-                acc.total_requests = int(state.get("total_requests") or 0)
-                acc.total_errors = int(state.get("total_errors") or 0)
-                acc.last_used = float(state.get("last_used") or 0)
-                acc.last_error = state.get("last_error")
+                account.total_requests = int(state.get("total_requests") or 0)
+                account.total_errors = int(state.get("total_errors") or 0)
+                account.last_used = float(state.get("last_used") or 0)
+                account.last_error = state.get("last_error")
             except (TypeError, ValueError):
                 continue
 
@@ -88,15 +91,15 @@ class AccountPool:
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             data = {
-                acc.name: {
-                    "exhausted_until": acc.exhausted_until,
-                    "consecutive_quota_hits": acc.consecutive_quota_hits,
-                    "total_requests": acc.total_requests,
-                    "total_errors": acc.total_errors,
-                    "last_used": acc.last_used,
-                    "last_error": acc.last_error,
+                account.name: {
+                    "exhausted_until": account.exhausted_until,
+                    "consecutive_quota_hits": account.consecutive_quota_hits,
+                    "total_requests": account.total_requests,
+                    "total_errors": account.total_errors,
+                    "last_used": account.last_used,
+                    "last_error": account.last_error,
                 }
-                for acc in self._accounts
+                for account in self._accounts
             }
             tmp = STATS_FILE.with_suffix(".tmp")
             tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -116,8 +119,6 @@ class AccountPool:
         self._last_persist_at = now
         self._persist_stats()
 
-    # ── Account registry ──────────────────────────────────────
-
     async def add_account(self, name: str, config: APIConfig) -> Account:
         AccountStore.save(name, config)
         account = Account(name=name, config=config)
@@ -131,6 +132,7 @@ class AccountPool:
             if target is not None:
                 self._accounts = [a for a in self._accounts if a.name != name]
         self._bindings.delete_account(name)
+        self._files.delete_account(name)
         if target is not None:
             await target.close()
         return AccountStore.delete(name)
@@ -148,14 +150,12 @@ class AccountPool:
     def _replace_accounts_for_test(self, accounts: list[Account]) -> None:
         self._accounts = list(accounts)
 
-    # ── Selection ─────────────────────────────────────────────
-
-    def _score(self, acc: Account) -> tuple:
+    def _score(self, account: Account) -> tuple:
         return (
-            1 if acc.lock.locked() else 0,
-            acc.consecutive_quota_hits,
-            acc.total_errors,
-            acc.last_used,
+            1 if account.lock.locked() else 0,
+            account.consecutive_quota_hits,
+            account.total_errors,
+            account.last_used,
             random.random(),
         )
 
@@ -172,8 +172,6 @@ class AccountPool:
 
     def _account_by_name(self, name: str) -> Optional[Account]:
         return next((account for account in self._accounts if account.name == name), None)
-
-    # ── Conversation lifecycle ────────────────────────────────
 
     def list_conversations(self) -> list[dict]:
         return self._bindings.list()
@@ -206,7 +204,26 @@ class AccountPool:
             if account.lock.locked():
                 account.lock.release()
 
-    # ── Streaming ─────────────────────────────────────────────
+    async def upload_file(
+        self,
+        content: bytes,
+        filename: str,
+        content_type: str,
+    ) -> tuple[str, str]:
+        account = await self._acquire_account(set())
+        try:
+            file_id = await account.client.upload_file(content, filename, content_type)
+            account.mark_success()
+            self._files.bind(file_id, account.name)
+            self._maybe_persist_stats()
+            return file_id, account.name
+        except Exception as error:
+            account.mark_error(error)
+            self._persist_stats()
+            raise
+        finally:
+            if account.lock.locked():
+                account.lock.release()
 
     async def send_message_stream(
         self,
@@ -220,20 +237,29 @@ class AccountPool:
         on_account_chosen: Optional[Callable[[Account], None]] = None,
         on_client_chosen: Optional[Callable[[Account, APIClient], None]] = None,
     ) -> AsyncGenerator[Token, None]:
-        """Send through a healthy account without silently migrating a conversation.
-
-        New conversations may fail over before any output is emitted. Once a
-        conversation has a persisted binding, quota or availability failures are
-        surfaced instead of moving it to another account and losing context.
-        """
-        rid = request_id or f"req_{int(time.time() * 1000)}"
+        """Send without moving an established conversation or uploaded file."""
+        request = request_id or f"req_{int(time.time() * 1000)}"
         binding = self._bindings.get(conversation_id)
-        excluded: set[str] = set()
+        if binding is not None:
+            metrics.incr("conversation_affinity_hits")
+        try:
+            file_account = self._files.account_for(file_ids)
+        except FileAffinityError as error:
+            raise NoAccountAvailableError(str(error)) from error
+        if binding is not None and file_account and binding.account_name != file_account:
+            raise NoAccountAvailableError(
+                f"Conversation '{conversation_id}' is pinned to '{binding.account_name}' "
+                f"but the attached file belongs to '{file_account}'."
+            )
 
+        excluded: set[str] = set()
         while True:
             was_bound = binding is not None
+            route_is_pinned = was_bound or file_account is not None
             if binding is not None:
                 account = await self._acquire_bound(binding)
+            elif file_account:
+                account = await self._acquire_named(file_account, conversation_id or "file request")
             else:
                 account = await self._acquire_account(excluded)
 
@@ -248,10 +274,9 @@ class AccountPool:
                     on_account_chosen,
                     on_client_chosen,
                 )
-
                 logger.info(
                     "[%s] using account=%s conversation=%s",
-                    rid,
+                    request,
                     account.name,
                     conversation_id or "<stateless>",
                 )
@@ -267,6 +292,8 @@ class AccountPool:
                             account.name,
                             client,
                         )
+                        if not was_bound:
+                            metrics.incr("conversation_bindings_total")
                     self._maybe_persist_stats()
                     return
                 except AuthExpiredError:
@@ -284,10 +311,9 @@ class AccountPool:
                         cooldown = account.mark_exhausted()
                         account.last_error = str(error)[:200]
                         self._persist_stats()
-                        if was_bound:
+                        if route_is_pinned:
                             raise NoAccountAvailableError(
-                                f"Conversation '{conversation_id}' is pinned to "
-                                f"quota-exhausted account '{account.name}'.",
+                                f"Request is pinned to quota-exhausted account '{account.name}'.",
                                 retry_after=cooldown,
                             ) from error
                         if conversation_id:
@@ -295,7 +321,7 @@ class AccountPool:
                         excluded.add(account.name)
                         logger.warning(
                             "[%s] %s quota-exhausted (cooldown %ds): %s",
-                            rid,
+                            request,
                             account.name,
                             int(cooldown),
                             error,
@@ -347,27 +373,24 @@ class AccountPool:
                 logger.exception("on_client_chosen callback raised")
 
     async def _acquire_bound(self, binding: ConversationBinding) -> Account:
-        account = self._account_by_name(binding.account_name)
+        return await self._acquire_named(binding.account_name, binding.conversation_id)
+
+    async def _acquire_named(self, account_name: str, label: str) -> Account:
+        account = self._account_by_name(account_name)
         if account is None:
             raise NoAccountAvailableError(
-                f"Conversation '{binding.conversation_id}' is pinned to missing "
-                f"account '{binding.account_name}'. Start a new conversation."
+                f"'{label}' is pinned to missing account '{account_name}'."
             )
         if not account.is_available:
             raise NoAccountAvailableError(
-                f"Conversation '{binding.conversation_id}' is pinned to unavailable "
-                f"account '{binding.account_name}'.",
+                f"'{label}' is pinned to unavailable account '{account_name}'.",
                 retry_after=account.cooldown_remaining,
             )
         try:
-            await asyncio.wait_for(
-                account.lock.acquire(),
-                timeout=ACQUIRE_TIMEOUT_SECONDS,
-            )
+            await asyncio.wait_for(account.lock.acquire(), timeout=ACQUIRE_TIMEOUT_SECONDS)
         except asyncio.TimeoutError as error:
             raise NoAccountAvailableError(
-                f"Account '{account.name}' is busy for conversation "
-                f"'{binding.conversation_id}'."
+                f"Account '{account.name}' is busy for '{label}'."
             ) from error
         if not account.is_available:
             account.lock.release()
@@ -412,8 +435,6 @@ class AccountPool:
             f"(excluded={len(excluded)}). Wait for cooldown or add more accounts.",
             retry_after=retry_after,
         )
-
-    # ── Status and shutdown ───────────────────────────────────
 
     def status(self) -> dict:
         snapshot = list(self._accounts)

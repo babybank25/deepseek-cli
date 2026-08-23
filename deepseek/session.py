@@ -1,6 +1,4 @@
-"""
-Session persistence — save/load APIConfig to/from disk.
-"""
+"""Session persistence — save/load APIConfig to/from disk."""
 import json
 import logging
 from typing import Optional
@@ -9,14 +7,14 @@ from .constants import CONFIG_DIR, CONFIG_FILE
 from .models import APIConfig
 
 logger = logging.getLogger(__name__)
+CURRENT_CONFIG_VERSION = 2
 
 
 class SessionManager:
-    """Save / load API config and full auth state."""
+    """Save/load API config and migrate old snapshots without losing auth."""
 
     @staticmethod
     def save_config(config: APIConfig) -> None:
-        """Atomically write config to disk (write tmp → rename)."""
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         tmp = CONFIG_FILE.with_suffix(".tmp")
         tmp.write_text(
@@ -27,40 +25,45 @@ class SessionManager:
 
     @staticmethod
     def load_config() -> Optional[APIConfig]:
-        """Load config from disk, returning None if missing or corrupted."""
         if not CONFIG_FILE.exists():
             return None
         try:
             raw = CONFIG_FILE.read_bytes()
-            # Try UTF-8 first, then fall back to common encodings
-            # (old deepseek_cli.py saved with system encoding on Windows = cp874/cp1252)
             text = None
-            for enc in ("utf-8", "utf-8-sig", "cp874", "cp1252", "latin-1"):
+            for encoding in ("utf-8", "utf-8-sig", "cp874", "cp1252", "latin-1"):
                 try:
-                    text = raw.decode(enc)
+                    text = raw.decode(encoding)
                     break
                 except (UnicodeDecodeError, LookupError):
                     continue
             if text is None:
-                logger.warning("Config file has unknown encoding; re-run --discover")
+                logger.warning("Config file has unknown encoding; run --repair")
                 return None
             data = json.loads(text)
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning("Config file corrupted (%s); re-run --discover", e)
+        except (json.JSONDecodeError, OSError) as error:
+            logger.warning("Config file corrupted (%s); run --repair", error)
             return None
         try:
             config = APIConfig.from_dict(data)
-        except (TypeError, KeyError) as e:
-            logger.warning("Config schema mismatch (%s); re-run --discover", e)
+        except (TypeError, KeyError) as error:
+            logger.warning("Config schema mismatch (%s); run --repair", error)
             return None
-        # Migrate: if file is not valid UTF-8 JSON, re-save (one-time)
+
+        needs_migration = False
         try:
             raw.decode("utf-8")
         except UnicodeDecodeError:
+            needs_migration = True
+        if config.config_version < CURRENT_CONFIG_VERSION:
+            config.config_version = CURRENT_CONFIG_VERSION
+            needs_migration = True
+        if "pow_worker_url" not in data:
+            needs_migration = True
+        if needs_migration:
             try:
                 SessionManager.save_config(config)
-            except Exception:
-                pass
+            except OSError:
+                logger.warning("Could not persist migrated config")
         return config
 
     @staticmethod

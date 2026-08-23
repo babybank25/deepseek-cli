@@ -1,25 +1,8 @@
-"""
-OpenAI-compatible HTTP API server backed by the DeepSeek client.
+"""OpenAI-compatible HTTP server backed by authenticated DeepSeek Web sessions."""
+from __future__ import annotations
 
-Endpoints:
-  POST /v1/chat/completions        — OpenAI-compatible (stream=true/false)
-  POST /v1/chat/completions        — with conversation_id for multi-turn
-  GET  /v1/conversations           — list active conversations
-  DELETE /v1/conversations/{id}    — end a conversation
-  POST /v1/files                   — upload a file (returns file_id)
-  GET  /v1/models                  — list available models
-  GET  /health                     — health check
-
-Multi-turn:
-  Pass "conversation_id" in the request body to maintain context across
-  requests. Each conversation_id gets its own DeepSeek session + lock.
-  Conversations expire after CONVERSATION_TTL seconds of inactivity.
-
-File upload:
-  Upload a file → get file_id → pass file_ids in chat request.
-  DeepSeek web API accepts ref_file_ids in the completion payload.
-"""
 import asyncio
+import hmac
 import json
 import re
 import sys
@@ -31,31 +14,51 @@ from typing import Optional
 from rich.console import Console
 from rich.panel import Panel
 
+from ._server_legacy import (
+    _apply_preset,
+    _classify_upstream_error,
+    _is_fresh_conversation,
+    _messages_to_prompt,
+    _model_to_preset,
+    _resolve_auto_compact_override,
+)
+from .api_key import is_api_key_authorized, load_or_create_api_key
+from .auth import AuthManager
 from .client import APIClient
-from .constants import REQUEST_TIMEOUT, VERSION, DEFAULT_SYSTEM_PROMPT
+from .constants import DEFAULT_SYSTEM_PROMPT, REQUEST_TIMEOUT, VERSION
+from .conversation import (
+    ConversationIndex,
+    ConversationState,
+    UnknownPreviousResponseError,
+)
 from .exceptions import AuthExpiredError
 from .gateway import AccountPool
 from .gateway.pool import NoAccountAvailableError
 from .metrics import metrics
 from .models import APIConfig
+from .openai_compat import (
+    chat_completion_to_response,
+    chat_message_to_response_output,
+    response_stream_created,
+    responses_request_to_chat,
+)
+from .protocol import probe_protocol
 from .session import SessionManager
-from .tools import compose_tools_prompt, extract_tool_calls
+from .tools import (
+    build_tool_recovery_prompt,
+    compose_tools_prompt,
+    extract_tool_calls,
+    messages_to_prompt,
+    tool_response_needs_recovery,
+)
 
 console = Console()
-
-# A rough character→token ratio used by the OpenAI-style ``usage`` block
-# in chat responses. Real tokenization would require shipping a tokenizer
-# (DeepSeek uses tiktoken-cl100k-base-ish). 4 char/token is the universal
-# OpenAI heuristic — close enough for billing-style reporting.
 _TOKEN_CHARS_PER_TOKEN = 4
-
-# Conversations expire after 30 minutes of inactivity
 CONVERSATION_TTL = 30 * 60
 
 
 @dataclass
 class Conversation:
-    """A single stateful conversation with its own DeepSeek session."""
     id: str
     client: APIClient
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -69,187 +72,156 @@ class Conversation:
         return time.time() - self.last_used > CONVERSATION_TTL
 
 
+def _recovery_system_prompt(state: Optional[ConversationState]) -> str:
+    """Replay prior canonical history only if a persisted upstream session dies."""
+    if state is None or not state.history:
+        return DEFAULT_SYSTEM_PROMPT
+    return (
+        DEFAULT_SYSTEM_PROMPT
+        + "\n\n[Recovered previous conversation]\n"
+        + messages_to_prompt(state.history)
+    )
+
+
 class ConversationPool:
-    """Pool of active conversations, each with its own APIClient + lock.
+    """Single-account per-conversation clients sharing one auth manager."""
 
-    Expired conversations are cleaned up lazily on each access.
-    """
-
-    def __init__(self, config: APIConfig, auto_compact_threshold: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        config: APIConfig,
+        auto_compact_threshold: Optional[int] = None,
+        auth_manager: Optional[AuthManager] = None,
+    ) -> None:
         self._config = config
         self._auto_compact_threshold = auto_compact_threshold
+        self._auth_manager = auth_manager or AuthManager(
+            config,
+            persist=SessionManager.save_config,
+        )
         self._conversations: dict[str, Conversation] = {}
         self._pool_lock = asyncio.Lock()
         self._cleanup_tasks: set[asyncio.Task] = set()
 
-    async def get_or_create(self, conversation_id: str) -> Conversation:
-        """Return existing conversation or create a new one."""
+    async def get_or_create(
+        self,
+        conversation_id: str,
+        state: Optional[ConversationState] = None,
+    ) -> Conversation:
         async with self._pool_lock:
             self._cleanup_expired()
             if conversation_id not in self._conversations:
-                client = APIClient(self._config)
-                client.system_prompt = DEFAULT_SYSTEM_PROMPT
+                client = APIClient(self._config, auth_manager=self._auth_manager)
+                client.system_prompt = _recovery_system_prompt(state)
                 if self._auto_compact_threshold is not None:
                     client.auto_compact_threshold = self._auto_compact_threshold
+                if state is not None and state.session_id:
+                    client.session_id = state.session_id
+                    client.last_message_id = state.parent_message_id
+                    client.model_type = state.model_type
+                    client.thinking_enabled = state.thinking_enabled
+                    client.search_enabled = state.search_enabled
+                    client._is_first_message = False
+                    client._session_flags = (
+                        client.model_type,
+                        client.thinking_enabled,
+                        client.search_enabled,
+                    )
                 self._conversations[conversation_id] = Conversation(
                     id=conversation_id,
                     client=client,
                 )
-            conv = self._conversations[conversation_id]
-            conv.touch()
-            return conv
+            conversation = self._conversations[conversation_id]
+            conversation.touch()
+            return conversation
 
     async def delete(self, conversation_id: str) -> bool:
-        """Remove a conversation. Won't preempt an in-flight request:
-        if the conversation lock is held, the conversation is removed from
-        the registry but its client is closed only after the lock frees."""
         async with self._pool_lock:
-            conv = self._conversations.pop(conversation_id, None)
-        if conv is None:
+            conversation = self._conversations.pop(conversation_id, None)
+        if conversation is None:
             return False
-        # Wait for any in-flight request to finish before tearing down the
-        # underlying httpx client (closing it mid-stream raises
-        # RuntimeError on the active request).
-        async with conv.lock:
-            await conv.client.close()
+        async with conversation.lock:
+            await conversation.client.close()
         return True
 
-    def get(self, conversation_id: str) -> Optional["Conversation"]:
-        """Return the conversation by id without creating one. None if absent."""
+    def get(self, conversation_id: str) -> Optional[Conversation]:
         return self._conversations.get(conversation_id)
 
     def __len__(self) -> int:
         return len(self._conversations)
 
     def list_conversations(self) -> list[dict]:
-        # Snapshot under no-lock is fine since dict iteration over .values()
-        # raises if mutated; copy first then filter expired without cleanup
-        # (cleanup happens under lock in get_or_create).
-        snapshot = list(self._conversations.values())
         now = time.time()
         return [
             {
-                "id": c.id,
-                "last_used": c.last_used,
-                "idle_seconds": int(now - c.last_used),
+                "id": conversation.id,
+                "last_used": conversation.last_used,
+                "idle_seconds": int(now - conversation.last_used),
             }
-            for c in snapshot
-            if not c.is_expired()
+            for conversation in list(self._conversations.values())
+            if not conversation.is_expired()
         ]
 
     def _cleanup_expired(self) -> None:
-        expired = [cid for cid, c in self._conversations.items() if c.is_expired()]
-        for cid in expired:
-            conv = self._conversations.pop(cid)
+        expired = [
+            conversation_id
+            for conversation_id, conversation in self._conversations.items()
+            if conversation.is_expired()
+        ]
+        for conversation_id in expired:
+            conversation = self._conversations.pop(conversation_id)
             try:
-                task = asyncio.create_task(conv.client.close())
+                task = asyncio.create_task(conversation.client.close())
                 self._cleanup_tasks.add(task)
                 task.add_done_callback(self._cleanup_tasks.discard)
             except RuntimeError:
-                # No running loop — skip; close_all() will handle it
                 pass
 
     async def close_all(self) -> None:
         async with self._pool_lock:
-            for conv in self._conversations.values():
-                await conv.client.close()
+            conversations = list(self._conversations.values())
             self._conversations.clear()
+        for conversation in conversations:
+            await conversation.client.close()
 
 
-# ── Pure helpers (used by chat_completions; no closure deps) ─────────────────
+def _merge_prior_history(prior: list[dict], incoming: list[dict]) -> list[dict]:
+    if not prior:
+        return list(incoming)
+    if len(incoming) >= len(prior) and incoming[: len(prior)] == prior:
+        return list(incoming)
+    return [*prior, *incoming]
 
 
-def _classify_upstream_error(err: Exception) -> tuple[int, str]:
-    """Map an unexpected ``APIClient`` error to an HTTP (status, detail) pair.
-
-    DeepSeek backend errors come through as ``RuntimeError("API error 422: ...")``.
-    A 4xx code from the upstream is almost always caused by client input
-    (bad file_id, bad message shape) and should surface as 4xx — not 500.
-    """
-    msg = str(err)
-    # Look for a "API error <code>" prefix from APIClient._raise_for_code or _do_stream
-    m = re.search(r"API error (\d{3})", msg)
-    if m:
-        code = int(m.group(1))
-        if 400 <= code < 500:
-            return 400, f"Upstream rejected: {msg}"
-        if 500 <= code < 600:
-            return 502, f"Upstream error: {msg}"
-    return 500, f"Upstream error: {msg}"
+def _payload_identifier(payload: dict, name: str) -> Optional[str]:
+    value = payload.get(name)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict):
+        nested = metadata.get(name)
+        if isinstance(nested, str) and nested.strip():
+            return nested.strip()
+    return None
 
 
-def _messages_to_prompt(messages: list[dict]) -> str:
-    """Extract the last user message, prepending system prompt on first turn."""
-    if not messages:
-        return ""
-    user_msgs = [m for m in messages if m.get("role") == "user"]
-    if not user_msgs:
-        return ""
-    system_msgs = [m for m in messages if m.get("role") == "system"]
-    last_user = user_msgs[-1].get("content", "")
-    if system_msgs and len(user_msgs) == 1:
-        sys_text = "\n\n".join(
-            m.get("content", "") for m in system_msgs if m.get("content")
-        )
-        if sys_text:
-            return f"[System]\n{sys_text}\n\n[User]\n{last_user}"
-    return last_user
-
-
-def _model_to_preset(model: str) -> dict:
-    """Map an OpenAI-style ``model`` string to a DeepSeek mode preset.
-
-    Presets follow the official web UI:
-      - expert / reasoner / r1 / think → Expert + R1 ON,  Search OFF
-      - everything else                → Fast   + R1 OFF, Search ON
-    """
-    m = (model or "").lower()
-    if "reasoner" in m or "r1" in m or "think" in m or "expert" in m:
-        return {
-            "model_type": "expert",
-            "thinking_enabled": True,
-            "search_enabled": False,
-        }
+def _usage(prompt: str, completion: str) -> dict:
+    prompt_tokens = len(prompt) // _TOKEN_CHARS_PER_TOKEN
+    completion_tokens = len(completion) // _TOKEN_CHARS_PER_TOKEN
     return {
-        "model_type": "default",
-        "thinking_enabled": False,
-        "search_enabled": True,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
     }
 
 
-def _apply_preset(client: APIClient, preset: dict) -> None:
-    """Apply a preset dict onto an APIClient (in-place)."""
-    if "model_type" in preset:
-        client.model_type = preset["model_type"]
-    if "thinking_enabled" in preset:
-        client.thinking_enabled = preset["thinking_enabled"]
-    if "search_enabled" in preset:
-        client.search_enabled = preset["search_enabled"]
-    if "auto_compact_threshold" in preset:
-        client.auto_compact_threshold = preset["auto_compact_threshold"]
-
-
-def _is_fresh_conversation(messages: list[dict]) -> bool:
-    return sum(1 for m in messages if m.get("role") == "user") <= 1
-
-
-def _resolve_auto_compact_override(payload: dict) -> Optional[int]:
-    """Read the ``auto_compact`` field from the request body.
-
-    Accepts:
-      • int   → custom threshold (0 disables for this request)
-      • False → disables for this request
-      • True  → keep the server default (returned as None)
-      • absent → no override (returned as None)
-    """
-    val = payload.get("auto_compact")
-    if val is False:
-        return 0
-    if isinstance(val, bool):
-        return None
-    if isinstance(val, int):
-        return max(0, val)
-    return None
+def _assistant_message(text: str, tools_active: bool) -> tuple[dict, str]:
+    if not tools_active:
+        return {"role": "assistant", "content": text}, "stop"
+    clean, calls = extract_tool_calls(text)
+    message: dict = {"role": "assistant", "content": clean or None}
+    if calls:
+        message["tool_calls"] = calls
+    return message, "tool_calls" if calls else "stop"
 
 
 async def serve_mode(
@@ -260,23 +232,11 @@ async def serve_mode(
     admin_token: Optional[str] = None,
     auto_compact_threshold: Optional[int] = None,
 ) -> None:
-    """Start the OpenAI-compatible API server.
-
-    If ``use_gateway`` is True, requests are routed through ``AccountPool``
-    (multi-account, smart selection, exponential cooldown). Otherwise the
-    server uses a single saved session (``config.json``).
-
-    ``admin_token`` (optional) protects ``/admin/*`` endpoints. If unset,
-    admin endpoints are disabled entirely.
-
-    ``auto_compact_threshold`` overrides the default rolling-summary
-    threshold for every client this server creates. ``None`` keeps the
-    package default (``constants.AUTO_COMPACT_THRESHOLD``); ``0`` disables.
-    """
+    """Start the secured OpenAI-compatible DeepSeek Web gateway."""
     try:
-        from fastapi import FastAPI, HTTPException, Header, Request, UploadFile, File
+        from fastapi import Depends, FastAPI, Header, HTTPException, Request, UploadFile, File
         from fastapi.middleware.cors import CORSMiddleware
-        from fastapi.responses import JSONResponse, StreamingResponse
+        from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
         import uvicorn
     except ImportError:
         console.print(
@@ -285,66 +245,71 @@ async def serve_mode(
         sys.exit(1)
 
     config = SessionManager.load_config()
-    if not config:
-        if use_gateway:
-            test_pool = AccountPool()
-            test_pool.load_all()
-            if test_pool.is_empty():
-                console.print("[red]No saved config found. Run with --discover first.[/]")
-                sys.exit(1)
-        else:
-            console.print("[red]No saved config found. Run with --discover first.[/]")
-            sys.exit(1)
+    if not config and not use_gateway:
+        console.print("[red]No saved config found. Run --discover/--repair first.[/]")
+        sys.exit(1)
 
-    # Initialize multi-account pool if gateway mode is on
     gateway_pool: Optional[AccountPool] = None
     if use_gateway:
         gateway_pool = AccountPool()
         loaded = gateway_pool.load_all()
         if loaded == 0:
-            console.print(
-                "[red]Gateway mode enabled but no accounts found. "
-                "Add accounts via Account Pool menu first.[/]"
-            )
+            console.print("[red]Gateway mode has no configured accounts.[/]")
             sys.exit(1)
         console.print(f"[green]Gateway: loaded {loaded} account(s)[/]")
         if auto_compact_threshold is not None:
-            for acc in gateway_pool.accounts:
-                acc.client.auto_compact_threshold = auto_compact_threshold
+            for account in gateway_pool.accounts:
+                account.client.auto_compact_threshold = auto_compact_threshold
 
-    pool = ConversationPool(
-        config, auto_compact_threshold=auto_compact_threshold
-    ) if config else None
-
-    # Single-client lock for requests that don't use conversation_id (non-gateway only)
-    _default_client = APIClient(config) if config and not use_gateway else None
-    if _default_client:
-        _default_client.system_prompt = DEFAULT_SYSTEM_PROMPT
+    shared_auth = (
+        AuthManager(config, persist=SessionManager.save_config)
+        if config is not None
+        else None
+    )
+    pool = (
+        ConversationPool(
+            config,
+            auto_compact_threshold=auto_compact_threshold,
+            auth_manager=shared_auth,
+        )
+        if config is not None
+        else None
+    )
+    default_client = (
+        APIClient(config, auth_manager=shared_auth)
+        if config is not None and not use_gateway and shared_auth is not None
+        else None
+    )
+    if default_client is not None:
+        default_client.system_prompt = DEFAULT_SYSTEM_PROMPT
         if auto_compact_threshold is not None:
-            _default_client.auto_compact_threshold = auto_compact_threshold
-    _default_lock = asyncio.Lock()
+            default_client.auto_compact_threshold = auto_compact_threshold
+    default_lock = asyncio.Lock()
+
+    key_info = load_or_create_api_key(api_key)
+    conversation_index = ConversationIndex()
 
     app = FastAPI(title="DeepSeek OpenAI-Compatible API", version=VERSION)
-
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
 
-    # ── Auth ──────────────────────────────────────────────────
-
-    def _check_auth(authorization: Optional[str]) -> None:
-        if api_key is None:
-            return
-        if not authorization or not authorization.startswith("Bearer "):
-            raise HTTPException(status_code=401, detail="Missing bearer token")
-        if authorization[7:] != api_key:
+    async def require_api_key(
+        authorization: Optional[str] = Header(None),
+        x_api_key: Optional[str] = Header(None, alias="x-api-key"),
+    ) -> None:
+        if not is_api_key_authorized(authorization, x_api_key, key_info.key):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
-    # ── Routes ────────────────────────────────────────────────
+    def check_admin(token: Optional[str]) -> None:
+        if not admin_token:
+            raise HTTPException(status_code=404, detail="Admin endpoints disabled")
+        if not token or not hmac.compare_digest(token, admin_token):
+            raise HTTPException(status_code=401, detail="Invalid admin token")
 
     @app.get("/health")
     async def health():
@@ -353,190 +318,170 @@ async def serve_mode(
             "version": VERSION,
             "mode": "gateway" if use_gateway else "single",
         }
-        if use_gateway and gateway_pool is not None:
+        if gateway_pool is not None:
             body["pool"] = gateway_pool.status()
         else:
             body["active_conversations"] = len(pool) if pool else 0
         return body
 
-    # ── Observability ─────────────────────────────────────────
-
     @app.get("/metrics")
     async def metrics_endpoint():
-        """Prometheus-format metrics. No auth — same convention as gateway."""
-        from fastapi.responses import PlainTextResponse
-        return PlainTextResponse(metrics.to_prometheus(), media_type="text/plain; version=0.0.4")
+        return PlainTextResponse(
+            metrics.to_prometheus(),
+            media_type="text/plain; version=0.0.4",
+        )
 
-    # ── Admin (account recovery / inspection) ─────────────────
-
-    def _check_admin(token: Optional[str]) -> None:
-        if not admin_token:
-            raise HTTPException(status_code=404, detail="Admin endpoints disabled")
-        if token != admin_token:
-            raise HTTPException(status_code=401, detail="Invalid admin token")
+    @app.get("/admin/probe")
+    async def admin_probe(x_admin_token: Optional[str] = Header(None)):
+        check_admin(x_admin_token)
+        if gateway_pool is not None:
+            results = []
+            for account in gateway_pool.accounts:
+                capabilities = await probe_protocol(account.config)
+                if not capabilities.auth_ok or not capabilities.pow_ok:
+                    metrics.incr("protocol_probe_fail_total")
+                results.append({"account": account.name, **capabilities.__dict__})
+            return {"results": results}
+        if config is None:
+            raise HTTPException(status_code=503, detail="No config")
+        capabilities = await probe_protocol(config)
+        if not capabilities.auth_ok or not capabilities.pow_ok:
+            metrics.incr("protocol_probe_fail_total")
+        return capabilities.__dict__
 
     @app.get("/admin/pool")
     async def admin_pool_status(x_admin_token: Optional[str] = Header(None)):
-        """Inspect pool status with cooldown ETAs and per-account stats."""
-        _check_admin(x_admin_token)
-        if not use_gateway or gateway_pool is None:
+        check_admin(x_admin_token)
+        if gateway_pool is None:
             raise HTTPException(status_code=404, detail="Gateway mode is not enabled")
         return gateway_pool.status()
 
     @app.post("/admin/pool/{name}/unblock")
     async def admin_pool_unblock(
-        name: str, x_admin_token: Optional[str] = Header(None)
+        name: str,
+        x_admin_token: Optional[str] = Header(None),
     ):
-        """Force-clear cooldown on a single account (e.g. after manual review).
-
-        Also drops a stale lock if one is held — useful when a previous
-        request was cancelled mid-flight without releasing the lock.
-        """
-        _check_admin(x_admin_token)
-        if not use_gateway or gateway_pool is None:
+        check_admin(x_admin_token)
+        if gateway_pool is None:
             raise HTTPException(status_code=404, detail="Gateway mode is not enabled")
-        for acc in gateway_pool.accounts:
-            if acc.name == name:
-                acc.exhausted_until = 0.0
-                acc.consecutive_quota_hits = 0
-                acc.last_error = None
-                # Replace the lock object if it's stuck. Tests for `lock.locked()`
-                # are intentional — we never preempt an in-flight request that
-                # is still streaming.
-                lock_was_stuck = False
-                if acc.lock.locked():
-                    # Heuristic: if the lock is held but the underlying client
-                    # has no inflight HTTP transport, the holder is gone.
-                    lock_was_stuck = True
-                    acc.lock = asyncio.Lock()
+        for account in gateway_pool.accounts:
+            if account.name == name:
+                account.exhausted_until = 0.0
+                account.consecutive_quota_hits = 0
+                account.last_error = None
                 gateway_pool.flush_stats()
-                return {"unblocked": name, "lock_replaced": lock_was_stuck}
+                return {"unblocked": name}
         raise HTTPException(status_code=404, detail=f"Account '{name}' not found")
 
     @app.post("/admin/compact")
     async def admin_compact_all(x_admin_token: Optional[str] = Header(None)):
-        """Force compact on the default client and every gateway account.
-
-        Useful before maintenance, after long idle periods, or to flush
-        large contexts manually.
-        """
-        _check_admin(x_admin_token)
+        check_admin(x_admin_token)
         results: list[dict] = []
-        if _default_client is not None:
-            async with _default_lock:
-                ok = await _default_client.compact_session()
-            results.append({"target": "default", "compacted": ok})
-        if use_gateway and gateway_pool is not None:
-            for acc in gateway_pool.accounts:
-                async with acc.lock:
-                    ok = await acc.client.compact_session()
-                results.append({"target": acc.name, "compacted": ok})
+        if default_client is not None:
+            async with default_lock:
+                results.append(
+                    {"target": "default", "compacted": await default_client.compact_session()}
+                )
+        if gateway_pool is not None:
+            for account in gateway_pool.accounts:
+                async with account.lock:
+                    results.append(
+                        {
+                            "target": account.name,
+                            "compacted": await account.client.compact_session(),
+                        }
+                    )
         return {"results": results}
 
-    @app.get("/v1/models")
-    async def list_models(authorization: Optional[str] = Header(None)):
-        _check_auth(authorization)
+    @app.get("/v1/models", dependencies=[Depends(require_api_key)])
+    async def list_models():
         now = int(time.time())
         return {
             "object": "list",
             "data": [
-                {"id": "deepseek-chat",     "object": "model", "created": now, "owned_by": "deepseek"},
-                {"id": "deepseek-fast",     "object": "model", "created": now, "owned_by": "deepseek"},
+                {"id": "deepseek-chat", "object": "model", "created": now, "owned_by": "deepseek"},
+                {"id": "deepseek-fast", "object": "model", "created": now, "owned_by": "deepseek"},
                 {"id": "deepseek-reasoner", "object": "model", "created": now, "owned_by": "deepseek"},
             ],
         }
 
-    @app.get("/v1/conversations")
-    async def list_conversations(authorization: Optional[str] = Header(None)):
-        """List all active conversations."""
-        _check_auth(authorization)
-        if pool is None:
-            return {"object": "list", "data": [], "ttl_seconds": CONVERSATION_TTL}
-        return {
-            "object": "list",
-            "data": pool.list_conversations(),
-            "ttl_seconds": CONVERSATION_TTL,
-        }
+    @app.get("/v1/conversations", dependencies=[Depends(require_api_key)])
+    async def list_conversations():
+        data = (
+            gateway_pool.list_conversations()
+            if gateway_pool is not None
+            else conversation_index.list_states()
+        )
+        return {"object": "list", "data": data, "ttl_seconds": CONVERSATION_TTL}
 
-    @app.delete("/v1/conversations/{conversation_id}")
-    async def delete_conversation(
-        conversation_id: str, authorization: Optional[str] = Header(None)
-    ):
-        """End a conversation and free its DeepSeek session."""
-        _check_auth(authorization)
-        if pool is None:
-            raise HTTPException(status_code=404, detail="Conversation not found")
-        deleted = await pool.delete(conversation_id)
+    @app.delete(
+        "/v1/conversations/{conversation_id}",
+        dependencies=[Depends(require_api_key)],
+    )
+    async def delete_conversation(conversation_id: str):
+        deleted = conversation_index.delete(conversation_id)
+        if gateway_pool is not None:
+            deleted = await gateway_pool.delete_conversation(conversation_id) or deleted
+        elif pool is not None:
+            deleted = await pool.delete(conversation_id) or deleted
         if not deleted:
             raise HTTPException(status_code=404, detail="Conversation not found")
         return {"deleted": True, "id": conversation_id}
 
-    @app.post("/v1/conversations/{conversation_id}/compact")
-    async def compact_conversation(
-        conversation_id: str, authorization: Optional[str] = Header(None)
-    ):
-        """Force-summarize the conversation; the next message will start a fresh
-        DeepSeek session pre-loaded with the summary."""
-        _check_auth(authorization)
-        if pool is None:
-            raise HTTPException(status_code=404, detail="Conversation not found")
-        conv = pool.get(conversation_id)
-        if conv is None:
-            raise HTTPException(status_code=404, detail="Conversation not found")
-        async with conv.lock:
-            ok = await conv.client.compact_session()
-        return {
-            "compacted": ok,
-            "id": conversation_id,
-            "summary_chars": len(conv.client._compact_summary) if ok else 0,
-        }
+    @app.post(
+        "/v1/conversations/{conversation_id}/compact",
+        dependencies=[Depends(require_api_key)],
+    )
+    async def compact_conversation(conversation_id: str):
+        if gateway_pool is not None:
+            compacted = await gateway_pool.compact_conversation(conversation_id)
+        elif pool is not None:
+            state = conversation_index.state(conversation_id)
+            conversation = pool.get(conversation_id)
+            if conversation is None and state is not None:
+                conversation = await pool.get_or_create(conversation_id, state)
+            if conversation is None:
+                raise HTTPException(status_code=404, detail="Conversation not found")
+            async with conversation.lock:
+                compacted = await conversation.client.compact_session()
+        else:
+            compacted = False
+        if not compacted:
+            raise HTTPException(status_code=409, detail="Conversation could not be compacted")
+        return {"compacted": True, "id": conversation_id}
 
-    @app.post("/v1/files")
-    async def upload_file(
-        file: UploadFile = File(...),
-        authorization: Optional[str] = Header(None),
-    ):
-        """Upload a file to DeepSeek and return a file_id.
-
-        The file_id can then be passed in chat completions via file_ids.
-        """
-        _check_auth(authorization)
-
+    @app.post("/v1/files", dependencies=[Depends(require_api_key)])
+    async def upload_file(file: UploadFile = File(...)):
         content = await file.read()
         filename = file.filename or "upload"
         content_type = file.content_type or "application/octet-stream"
-
         try:
-            # In gateway mode, pick the best available account (same scoring
-            # as chat completions); otherwise fall back to the default client.
-            client_for_upload = None
-            if use_gateway and gateway_pool is not None:
-                gw_accounts = gateway_pool.available_accounts() or gateway_pool.accounts
-                if gw_accounts:
-                    # Use the pool's scoring to pick the least-loaded account
-                    # without going through the full streaming code path.
-                    chosen_acc = min(gw_accounts, key=gateway_pool._score)
-                    client_for_upload = chosen_acc.client
+            if gateway_pool is not None:
+                file_id, account_name = await gateway_pool.upload_file(
+                    content,
+                    filename,
+                    content_type,
+                )
             else:
-                client_for_upload = _default_client
-            if client_for_upload is None:
-                metrics.incr("file_uploads_failed_total")
-                raise HTTPException(status_code=503, detail="No client available")
-            file_id = await client_for_upload.upload_file(content, filename, content_type)
+                if default_client is None:
+                    raise HTTPException(status_code=503, detail="No client available")
+                async with default_lock:
+                    file_id = await default_client.upload_file(
+                        content,
+                        filename,
+                        content_type,
+                    )
+                account_name = None
             metrics.incr("file_uploads_total")
-        except AuthExpiredError as e:
+        except AuthExpiredError as error:
             metrics.incr("file_uploads_failed_total")
-            raise HTTPException(status_code=401, detail=str(e))
-        except RuntimeError as e:
-            metrics.incr("file_uploads_failed_total")
-            raise HTTPException(status_code=502, detail=str(e))
+            raise HTTPException(status_code=401, detail=str(error)) from error
         except HTTPException:
             raise
-        except Exception as e:
+        except Exception as error:
             metrics.incr("file_uploads_failed_total")
-            raise HTTPException(status_code=502, detail=f"Upload error: {e}")
-
-        return {
+            raise HTTPException(status_code=502, detail=f"Upload error: {error}") from error
+        body = {
             "id": file_id,
             "object": "file",
             "filename": filename,
@@ -544,374 +489,493 @@ async def serve_mode(
             "created_at": int(time.time()),
             "purpose": "assistants",
         }
+        if account_name:
+            body["account"] = account_name
+        return body
 
-    @app.post("/v1/chat/completions")
-    async def chat_completions(
-        request: Request, authorization: Optional[str] = Header(None)
-    ):
-        _check_auth(authorization)
+    async def handle_chat_payload(payload: dict, *, style: str):
         metrics.incr("requests_total")
-        req_started_at = time.time()
-        try:
-            payload = await request.json()
-        except Exception:
-            metrics.incr("failed_requests_total")
-            raise HTTPException(status_code=400, detail="Invalid JSON body")
-
-        messages = payload.get("messages", [])
+        started = time.time()
+        messages = payload.get("messages")
         if not isinstance(messages, list) or not messages:
             raise HTTPException(status_code=400, detail="'messages' must be a non-empty list")
+        messages = [message for message in messages if isinstance(message, dict)]
+        if not messages:
+            raise HTTPException(status_code=400, detail="No valid messages")
 
-        model = payload.get("model", "deepseek-chat")
+        model = str(payload.get("model") or "deepseek-chat")
         stream = bool(payload.get("stream", False))
-        conversation_id: Optional[str] = payload.get("conversation_id")
-        # Defensive copy: caller's list could be mutated after we keep a reference
-        raw_file_ids = payload.get("file_ids", [])
-        file_ids: list[str] = list(raw_file_ids) if isinstance(raw_file_ids, list) else []
+        tools = payload.get("tools") if isinstance(payload.get("tools"), list) else []
+        tools_active = bool(tools) and payload.get("tool_choice") != "none"
+        file_ids = (
+            list(payload.get("file_ids"))
+            if isinstance(payload.get("file_ids"), list)
+            else []
+        )
 
-        tools = payload.get("tools") or []
-        tool_choice = payload.get("tool_choice")
-        if not isinstance(tools, list):
-            tools = []
-        # "tool_choice": "none" disables tool emission even when tools defined
-        tools_active = bool(tools) and tool_choice != "none"
+        try:
+            resolution = conversation_index.resolve(
+                messages=messages,
+                conversation_id=_payload_identifier(payload, "conversation_id"),
+                chat_session_id=_payload_identifier(payload, "chat_session_id"),
+                previous_response_id=_payload_identifier(payload, "previous_response_id"),
+            )
+        except UnknownPreviousResponseError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
-        # Tools mode is stateless by design — DeepSeek has no tool-calling
-        # protocol, so we flatten the entire conversation into one prompt
-        # each time. Mixing tools with conversation_id is contradictory:
-        # warn the client by ignoring the conversation_id and surfacing the
-        # decision in a response header (set further down).
-        tools_with_conversation_warning = bool(tools_active and conversation_id)
-        if tools_with_conversation_warning:
-            conversation_id = None
-
-        # ── Per-request auto-compact override ─────────────────
-        # Body field "auto_compact" may be:
-        #   • int  → custom threshold (0 disables for this request)
-        #   • bool → True keeps default, False disables
-        #   • absent → no override
-        ac_threshold_for_request = _resolve_auto_compact_override(payload)
+        conversation_id = resolution.conversation_id
+        prior_state = conversation_index.state(conversation_id)
+        prior_history = prior_state.history if prior_state is not None else []
+        effective_messages = _merge_prior_history(prior_history, messages)
 
         if tools_active:
-            # Tools mode is stateless — flatten the entire conversation into
-            # one prompt so the model sees full context (DeepSeek lacks
-            # native tool-calling).
-            prompt = compose_tools_prompt(messages, tools)
-            # Force fresh session so previous turns don't leak into the
-            # plaintext-encoded conversation.
-            is_fresh = True
+            prompt = compose_tools_prompt(effective_messages, tools)
+        elif resolution.is_new and len(effective_messages) > 1:
+            prompt = messages_to_prompt(effective_messages)
         else:
-            prompt = _messages_to_prompt(messages)
-            is_fresh = _is_fresh_conversation(messages)
+            prompt = _messages_to_prompt(effective_messages)
         if not prompt:
             raise HTTPException(status_code=400, detail="No user message found")
 
-        completion_id = f"chatcmpl-{int(time.time() * 1000)}"
+        auto_compact = _resolve_auto_compact_override(payload)
+        preset = _model_to_preset(model)
+        if auto_compact is not None:
+            preset["auto_compact_threshold"] = auto_compact
+
+        request_id = f"r{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+        chat_id = f"chatcmpl-{uuid.uuid4().hex}"
+        response_id = f"resp_{uuid.uuid4().hex}"
         created = int(time.time())
+        chosen: dict[str, object] = {"client": None, "account": None}
+        transport_conversation = None if tools_active else conversation_id
 
-        # ── Pick client + lock ────────────────────────────────
-        # Gateway mode: route through AccountPool (per-account locks, smart pick)
-        # Single mode: use _default_client / conversation pool
-        if use_gateway:
-            active_client = None
-            active_lock = None
-            is_fresh_for_conv = is_fresh
-        elif conversation_id and not tools_active:
-            # Multi-turn: use dedicated client for this conversation
-            assert pool is not None
-            conv = await pool.get_or_create(conversation_id)
-            active_client = conv.client
-            active_lock = conv.lock
-            is_fresh_for_conv = False  # conversation manages its own session continuity
-        else:
-            # Stateless: use default client
-            active_client = _default_client
-            active_lock = _default_lock
-            is_fresh_for_conv = is_fresh
+        def remember_choice(account, client) -> None:
+            chosen["account"] = account
+            chosen["client"] = client
+            client.system_prompt = (
+                DEFAULT_SYSTEM_PROMPT
+                if tools_active
+                else _recovery_system_prompt(prior_state)
+            )
 
-        request_id = f"r{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
-        # Tracks which client served this request. In gateway mode the pool
-        # populates this via ``on_account_chosen`` callback. In single mode
-        # it is set immediately after lock acquire.
-        chosen_client: dict[str, Optional[APIClient]] = {"client": None}
-
-        async def generate():
-            # Gateway path: pool routes + handles per-account locking itself.
-            if use_gateway:
-                assert gateway_pool is not None
-                # Build preset for the chosen account; pool applies it under lock.
-                preset = _model_to_preset(model)
-                if ac_threshold_for_request is not None:
-                    preset["auto_compact_threshold"] = ac_threshold_for_request
+        async def generate_once(
+            prompt_text: str,
+            *,
+            reset_session: bool = False,
+        ):
+            if gateway_pool is not None:
                 try:
                     async for token_type, token_text in gateway_pool.send_message_stream(
-                        prompt,
+                        prompt_text,
                         request_id=request_id,
+                        conversation_id=transport_conversation,
                         model_preset=preset,
-                        file_ids=file_ids if file_ids else None,
-                        on_account_chosen=lambda acc: chosen_client.update(client=acc.client),
+                        file_ids=file_ids or None,
+                        reset_session=reset_session or tools_active,
+                        on_client_chosen=remember_choice,
                     ):
                         if token_type == "text":
                             yield token_text
-                except AuthExpiredError as e:
-                    raise HTTPException(status_code=401, detail=str(e))
-                except NoAccountAvailableError as e:
+                except NoAccountAvailableError as error:
                     headers = {}
-                    if e.retry_after is not None:
-                        headers["Retry-After"] = str(int(e.retry_after) + 1)
-                    raise HTTPException(
-                        status_code=503, detail=str(e), headers=headers
-                    )
-                except Exception as e:
-                    status, detail = _classify_upstream_error(e)
-                    raise HTTPException(status_code=status, detail=detail)
+                    if error.retry_after is not None:
+                        headers["Retry-After"] = str(int(error.retry_after) + 1)
+                    raise HTTPException(status_code=503, detail=str(error), headers=headers) from error
+                except AuthExpiredError as error:
+                    raise HTTPException(status_code=401, detail=str(error)) from error
+                except Exception as error:
+                    status, detail = _classify_upstream_error(error)
+                    raise HTTPException(status_code=status, detail=detail) from error
                 return
 
-            # Single-client path
-            assert active_lock is not None and active_client is not None
-            chosen_client["client"] = active_client
+            if tools_active:
+                client = default_client
+                lock = default_lock
+                state = None
+            else:
+                if pool is None:
+                    raise HTTPException(status_code=503, detail="No client available")
+                conversation = await pool.get_or_create(conversation_id, prior_state)
+                client = conversation.client
+                lock = conversation.lock
+                state = prior_state
+            if client is None:
+                raise HTTPException(status_code=503, detail="No client available")
+            chosen["client"] = client
             acquired = False
-            saved_threshold: Optional[int] = None
+            previous_threshold: Optional[int] = None
             try:
                 try:
-                    await asyncio.wait_for(active_lock.acquire(), timeout=REQUEST_TIMEOUT)
-                except asyncio.TimeoutError:
-                    raise HTTPException(
-                        status_code=503,
-                        detail="Server busy — another request is in progress. Try again shortly.",
-                    )
+                    await asyncio.wait_for(lock.acquire(), timeout=REQUEST_TIMEOUT)
+                except asyncio.TimeoutError as error:
+                    raise HTTPException(status_code=503, detail="Server busy") from error
                 acquired = True
-                _apply_preset(active_client, _model_to_preset(model))
-                if ac_threshold_for_request is not None:
-                    saved_threshold = active_client.auto_compact_threshold
-                    active_client.auto_compact_threshold = ac_threshold_for_request
-                if is_fresh_for_conv:
-                    await active_client.reset_session()
-
-                # Inject file_ids into the client's next request
+                _apply_preset(client, preset)
+                if auto_compact is not None:
+                    previous_threshold = client.auto_compact_threshold
+                    client.auto_compact_threshold = auto_compact
+                if reset_session or tools_active:
+                    await client.reset_session()
+                client.system_prompt = (
+                    DEFAULT_SYSTEM_PROMPT
+                    if tools_active
+                    else _recovery_system_prompt(state)
+                )
                 if file_ids:
-                    active_client.set_pending_files(file_ids)
-
-                async for token_type, token_text in active_client.send_message_stream(prompt):
+                    client.set_pending_files(file_ids)
+                async for token_type, token_text in client.send_message_stream(prompt_text):
                     if token_type == "text":
                         yield token_text
-            except AuthExpiredError as e:
-                raise HTTPException(status_code=401, detail=str(e))
+            except AuthExpiredError as error:
+                raise HTTPException(status_code=401, detail=str(error)) from error
             except HTTPException:
                 raise
-            except Exception as e:
-                status, detail = _classify_upstream_error(e)
-                raise HTTPException(status_code=status, detail=detail)
+            except Exception as error:
+                status, detail = _classify_upstream_error(error)
+                raise HTTPException(status_code=status, detail=detail) from error
             finally:
-                # Restore threshold so per-request override doesn't leak.
-                if saved_threshold is not None and active_client is not None:
-                    active_client.auto_compact_threshold = saved_threshold
+                if previous_threshold is not None:
+                    client.auto_compact_threshold = previous_threshold
                 if acquired:
-                    active_lock.release()
+                    lock.release()
 
-        if stream:
-            metrics.incr("streamed_requests_total")
-            async def sse_stream():
-                buffered = ""
+        async def collect_with_tool_recovery() -> str:
+            text = ""
+            async for chunk in generate_once(prompt):
+                text += chunk
+            if tools_active and tool_response_needs_recovery(text):
+                metrics.incr("tool_recovery_total")
+                retry_text = ""
+                async for chunk in generate_once(
+                    build_tool_recovery_prompt(prompt),
+                    reset_session=True,
+                ):
+                    retry_text += chunk
+                text = retry_text
+                if not tool_response_needs_recovery(text):
+                    metrics.incr("tool_recovery_success_total")
+            return text
+
+        def remember_response(assistant: dict, public_response_id: str) -> None:
+            client = chosen.get("client")
+            session_id = None
+            parent_id = None
+            model_type = preset["model_type"]
+            thinking_enabled = bool(preset["thinking_enabled"])
+            search_enabled = bool(preset["search_enabled"])
+            if isinstance(client, APIClient) and not tools_active:
+                session_id = client.session_id
+                parent_id = client.last_message_id
+                model_type = client.model_type
+                thinking_enabled = client.thinking_enabled
+                search_enabled = client.search_enabled
+            conversation_index.remember(
+                conversation_id=conversation_id,
+                response_id=public_response_id,
+                request_messages=effective_messages,
+                assistant_message=assistant,
+                session_id=session_id,
+                parent_message_id=parent_id,
+                model_type=model_type,
+                thinking_enabled=thinking_enabled,
+                search_enabled=search_enabled,
+            )
+
+        if not stream:
+            try:
+                full_text = await collect_with_tool_recovery()
+            except HTTPException as error:
+                metrics.incr("failed_requests_total")
+                if error.status_code == 401:
+                    metrics.incr("auth_errors_total")
+                elif error.status_code == 503:
+                    metrics.incr("pool_no_account_total")
+                raise
+            assistant, finish_reason = _assistant_message(full_text, tools_active)
+            chat_body = {
+                "id": chat_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": assistant,
+                        "finish_reason": finish_reason,
+                    }
+                ],
+                "usage": _usage(prompt, full_text),
+                "conversation_id": conversation_id,
+            }
+            public_id = response_id if style == "responses" else chat_id
+            remember_response(assistant, public_id)
+            metrics.observe_latency((time.time() - started) * 1000)
+            headers = {
+                "X-Request-Id": request_id,
+                "X-Mode": "gateway" if gateway_pool is not None else "single",
+                "X-Conversation-Id": conversation_id,
+            }
+            account = chosen.get("account")
+            if account is not None and hasattr(account, "name"):
+                headers["X-Account-Used"] = str(account.name)
+            if style == "responses":
+                body = chat_completion_to_response(
+                    chat_body,
+                    response_id=response_id,
+                    conversation_id=conversation_id,
+                )
+                body["previous_response_id"] = _payload_identifier(payload, "previous_response_id")
+                return JSONResponse(body, headers=headers)
+            return JSONResponse(chat_body, headers=headers)
+
+        metrics.incr("streamed_requests_total")
+        if style == "responses":
+            async def responses_stream():
+                full_text = ""
+                assistant: dict = {"role": "assistant", "content": ""}
                 try:
-                    async for chunk in generate():
-                        if tools_active:
-                            # Buffer entire reply: tool-call detection requires
-                            # the whole text. We emit one consolidated chunk
-                            # at the end with the parsed tool_calls.
-                            buffered += chunk
-                            continue
-                        sse_data = {
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices": [
-                                {"index": 0, "delta": {"content": chunk}, "finish_reason": None}
-                            ],
-                        }
-                        if conversation_id:
-                            sse_data["conversation_id"] = conversation_id
-                        yield f"data: {json.dumps(sse_data, ensure_ascii=False)}\n\n"
-
+                    yield "data: " + json.dumps(
+                        response_stream_created(response_id, model, conversation_id),
+                        ensure_ascii=False,
+                    ) + "\n\n"
                     if tools_active:
-                        clean_text, tool_calls = extract_tool_calls(buffered)
-                        first_delta: dict = {"role": "assistant"}
-                        if clean_text:
-                            first_delta["content"] = clean_text
-                        if tool_calls:
-                            first_delta["tool_calls"] = tool_calls
-                        first_chunk = {
-                            "id": completion_id,
+                        full_text = await collect_with_tool_recovery()
+                        assistant, _ = _assistant_message(full_text, True)
+                        for index, item in enumerate(chat_message_to_response_output(assistant)):
+                            yield "data: " + json.dumps(
+                                {
+                                    "type": "response.output_item.added",
+                                    "output_index": index,
+                                    "item": item,
+                                },
+                                ensure_ascii=False,
+                            ) + "\n\n"
+                            yield "data: " + json.dumps(
+                                {
+                                    "type": "response.output_item.done",
+                                    "output_index": index,
+                                    "item": item,
+                                },
+                                ensure_ascii=False,
+                            ) + "\n\n"
+                    else:
+                        item_id = f"msg_{uuid.uuid4().hex}"
+                        yield "data: " + json.dumps(
+                            {
+                                "type": "response.output_item.added",
+                                "output_index": 0,
+                                "item": {
+                                    "id": item_id,
+                                    "type": "message",
+                                    "status": "in_progress",
+                                    "role": "assistant",
+                                    "content": [],
+                                },
+                            }
+                        ) + "\n\n"
+                        async for chunk in generate_once(prompt):
+                            full_text += chunk
+                            yield "data: " + json.dumps(
+                                {
+                                    "type": "response.output_text.delta",
+                                    "item_id": item_id,
+                                    "output_index": 0,
+                                    "content_index": 0,
+                                    "delta": chunk,
+                                },
+                                ensure_ascii=False,
+                            ) + "\n\n"
+                        assistant = {"role": "assistant", "content": full_text}
+                        yield "data: " + json.dumps(
+                            {
+                                "type": "response.output_text.done",
+                                "item_id": item_id,
+                                "output_index": 0,
+                                "content_index": 0,
+                                "text": full_text,
+                            },
+                            ensure_ascii=False,
+                        ) + "\n\n"
+                    chat_body = {
+                        "id": chat_id,
+                        "created": created,
+                        "model": model,
+                        "choices": [{"message": assistant}],
+                        "usage": _usage(prompt, full_text),
+                    }
+                    completed = chat_completion_to_response(
+                        chat_body,
+                        response_id=response_id,
+                        conversation_id=conversation_id,
+                    )
+                    completed["previous_response_id"] = _payload_identifier(
+                        payload, "previous_response_id"
+                    )
+                    remember_response(assistant, response_id)
+                    metrics.observe_latency((time.time() - started) * 1000)
+                    yield "data: " + json.dumps(
+                        {"type": "response.completed", "response": completed},
+                        ensure_ascii=False,
+                    ) + "\n\n"
+                except HTTPException as error:
+                    metrics.incr("failed_requests_total")
+                    yield "data: " + json.dumps(
+                        {
+                            "type": "error",
+                            "code": error.status_code,
+                            "message": str(error.detail),
+                        },
+                        ensure_ascii=False,
+                    ) + "\n\n"
+            return StreamingResponse(responses_stream(), media_type="text/event-stream")
+
+        async def chat_stream():
+            full_text = ""
+            try:
+                if tools_active:
+                    full_text = await collect_with_tool_recovery()
+                    assistant, finish_reason = _assistant_message(full_text, True)
+                    delta = {"role": "assistant", **assistant}
+                    delta.pop("role", None)
+                    yield "data: " + json.dumps(
+                        {
+                            "id": chat_id,
                             "object": "chat.completion.chunk",
                             "created": created,
                             "model": model,
                             "choices": [
-                                {"index": 0, "delta": first_delta, "finish_reason": None}
+                                {"index": 0, "delta": delta, "finish_reason": None}
                             ],
-                        }
-                        if conversation_id:
-                            first_chunk["conversation_id"] = conversation_id
-                        yield f"data: {json.dumps(first_chunk, ensure_ascii=False)}\n\n"
-                        finish = "tool_calls" if tool_calls else "stop"
-                    else:
-                        finish = "stop"
-
-                    final = {
-                        "id": completion_id,
+                            "conversation_id": conversation_id,
+                        },
+                        ensure_ascii=False,
+                    ) + "\n\n"
+                else:
+                    finish_reason = "stop"
+                    async for chunk in generate_once(prompt):
+                        full_text += chunk
+                        yield "data: " + json.dumps(
+                            {
+                                "id": chat_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": chunk},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                                "conversation_id": conversation_id,
+                            },
+                            ensure_ascii=False,
+                        ) + "\n\n"
+                    assistant = {"role": "assistant", "content": full_text}
+                if tools_active:
+                    assistant, finish_reason = _assistant_message(full_text, True)
+                remember_response(assistant, chat_id)
+                metrics.observe_latency((time.time() - started) * 1000)
+                yield "data: " + json.dumps(
+                    {
+                        "id": chat_id,
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
-                    }
-                    if conversation_id:
-                        final["conversation_id"] = conversation_id
-                    yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n"
-                    yield "data: [DONE]\n\n"
-                    metrics.observe_latency((time.time() - req_started_at) * 1000)
-                except HTTPException as e:
-                    metrics.incr("failed_requests_total")
-                    if e.status_code == 401:
-                        metrics.incr("auth_errors_total")
-                    elif e.status_code == 503:
-                        metrics.incr("pool_no_account_total")
-                    err = {"error": {"message": e.detail, "type": "upstream_error", "code": e.status_code}}
-                    yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+                        "choices": [
+                            {"index": 0, "delta": {}, "finish_reason": finish_reason}
+                        ],
+                        "conversation_id": conversation_id,
+                    },
+                    ensure_ascii=False,
+                ) + "\n\n"
+                yield "data: [DONE]\n\n"
+            except HTTPException as error:
+                metrics.incr("failed_requests_total")
+                yield "data: " + json.dumps(
+                    {
+                        "error": {
+                            "message": str(error.detail),
+                            "type": "upstream_error",
+                            "code": error.status_code,
+                        }
+                    },
+                    ensure_ascii=False,
+                ) + "\n\n"
+        return StreamingResponse(chat_stream(), media_type="text/event-stream")
 
-            stream_headers: dict[str, str] = {
-                "X-Model-Used": model,
-                "X-Mode": "gateway" if use_gateway else "single",
-                "X-Tools-Active": "1" if tools_active else "0",
-                "X-Request-Id": request_id,
-                # NB: For streaming we cannot know whether compact fired
-                # until the generator runs. Best-effort: clients should
-                # check the non-stream endpoint or /admin/compact response.
-                "X-Auto-Compact-Available": "1",
-            }
-            if tools_with_conversation_warning:
-                stream_headers["X-Conversation-Ignored"] = "tools-mode-is-stateless"
-            return StreamingResponse(
-                sse_stream(),
-                media_type="text/event-stream",
-                headers=stream_headers,
-            )
-
-        # Non-streaming
-        full_text = ""
+    @app.post("/v1/chat/completions", dependencies=[Depends(require_api_key)])
+    async def chat_completions(request: Request):
         try:
-            async for chunk in generate():
-                full_text += chunk
-        except HTTPException as e:
-            metrics.incr("failed_requests_total")
-            if e.status_code == 401:
-                metrics.incr("auth_errors_total")
-            elif e.status_code == 503:
-                metrics.incr("pool_no_account_total")
-            raise
+            payload = await request.json()
+        except Exception as error:
+            raise HTTPException(status_code=400, detail="Invalid JSON body") from error
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="JSON body must be an object")
+        return await handle_chat_payload(payload, style="chat")
 
-        if tools_active:
-            clean_text, tool_calls = extract_tool_calls(full_text)
-            message_obj: dict = {"role": "assistant", "content": clean_text or None}
-            if tool_calls:
-                message_obj["tool_calls"] = tool_calls
-            finish_reason = "tool_calls" if tool_calls else "stop"
-        else:
-            message_obj = {"role": "assistant", "content": full_text}
-            finish_reason = "stop"
+    @app.post("/v1/responses", dependencies=[Depends(require_api_key)])
+    async def responses(request: Request):
+        try:
+            payload = await request.json()
+        except Exception as error:
+            raise HTTPException(status_code=400, detail="Invalid JSON body") from error
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="JSON body must be an object")
+        chat_payload = responses_request_to_chat(payload)
+        return await handle_chat_payload(chat_payload, style="responses")
 
-        response_body = {
-            "id": completion_id,
-            "object": "chat.completion",
-            "created": created,
-            "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": message_obj,
-                    "finish_reason": finish_reason,
-                }
-            ],
-            "usage": {
-                "prompt_tokens": len(prompt) // _TOKEN_CHARS_PER_TOKEN,
-                "completion_tokens": len(full_text) // _TOKEN_CHARS_PER_TOKEN,
-                "total_tokens": (len(prompt) + len(full_text)) // _TOKEN_CHARS_PER_TOKEN,
-            },
-        }
-        if conversation_id:
-            response_body["conversation_id"] = conversation_id
-
-        metrics.observe_latency((time.time() - req_started_at) * 1000)
-        # Detect whether auto-compact fired during this request.
-        compact_fired = False
-        chosen = chosen_client["client"]
-        if chosen is not None and chosen._just_compacted:
-            compact_fired = True
-            chosen._just_compacted = False
-
-        response_headers: dict[str, str] = {
-            "X-Model-Used": model,
-            "X-Mode": "gateway" if use_gateway else "single",
-            "X-Tools-Active": "1" if tools_active else "0",
-            "X-Request-Id": request_id,
-            "X-Auto-Compact-Triggered": "1" if compact_fired else "0",
-        }
-        if tools_with_conversation_warning:
-            response_headers["X-Conversation-Ignored"] = (
-                "tools-mode-is-stateless"
-            )
-        # Surface which account served the request (gateway mode only).
-        if use_gateway and gateway_pool is not None and chosen is not None:
-            for acc in gateway_pool.accounts:
-                if acc.client is chosen:
-                    response_headers["X-Account-Used"] = acc.name
-                    break
-
-        return JSONResponse(response_body, headers=response_headers)
-
-    # ── Startup banner ────────────────────────────────────────
+    key_location = str(key_info.path) if key_info.path else key_info.source
     mode_label = (
-        f"[bold cyan]gateway[/] (pool of {len(gateway_pool.accounts)})"
-        if use_gateway and gateway_pool
+        f"gateway ({len(gateway_pool.accounts)} accounts)"
+        if gateway_pool is not None
         else "single-account"
     )
     console.print(
         Panel.fit(
-            f"[bold green]🚀 DeepSeek API Server[/] [dim]v{VERSION}[/]\n"
+            f"[bold green]DeepSeek API Server[/] [dim]v{VERSION}[/]\n"
             f"Listening on: [bold]http://{host}:{port}[/]\n"
             f"Mode: {mode_label}\n"
-            f"Endpoints:\n"
-            f"  POST /v1/chat/completions  — chat (+ tools, conversation_id, file_ids, auto_compact)\n"
-            f"  POST /v1/files             — upload file → get file_id\n"
-            f"  GET  /v1/conversations     — list active conversations\n"
-            f"  POST /v1/conversations/{{id}}/compact — manual rolling-summary\n"
-            f"  DELETE /v1/conversations/{{id}} — end conversation\n"
-            f"  GET  /v1/models | GET /health | GET /metrics\n"
-            f"  POST /admin/pool/{{name}}/unblock  (X-Admin-Token)\n"
-            f"  POST /admin/compact                (X-Admin-Token)\n"
-            f"Tool calling: [green]emulated via prompt[/] (OpenAI-compatible)\n"
-            f"Auto-compact: {auto_compact_threshold if auto_compact_threshold is not None else 'default'} turns\n"
-            f"Auth: {'Bearer token required' if api_key else '[yellow]disabled[/]'} | "
-            f"Admin: {'enabled' if admin_token else '[dim]disabled[/]'} | "
-            f"CORS: all origins | "
-            f"Conv TTL: {CONVERSATION_TTL//60}min",
+            f"API auth: required ({key_info.source}; {key_location})\n"
+            f"POST /v1/chat/completions\n"
+            f"POST /v1/responses\n"
+            f"POST /v1/files\n"
+            f"GET /v1/models | GET /v1/conversations\n"
+            f"GET /health | GET /metrics\n"
+            f"GET /admin/probe (X-Admin-Token)",
             border_style="green",
         )
     )
 
-    uv_config = uvicorn.Config(
-        app,
-        host=host,
-        port=port,
-        log_level="warning",
-        access_log=False,
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            log_level="warning",
+            access_log=False,
+        )
     )
-    server = uvicorn.Server(uv_config)
     try:
         await server.serve()
     finally:
         if pool is not None:
             await pool.close_all()
-        if _default_client is not None:
-            await _default_client.close()
+        if default_client is not None:
+            await default_client.close()
         if gateway_pool is not None:
             await gateway_pool.close_all()
+
+
+__all__ = [
+    "Conversation",
+    "ConversationPool",
+    "serve_mode",
+    "_apply_preset",
+    "_classify_upstream_error",
+    "_is_fresh_conversation",
+    "_messages_to_prompt",
+    "_model_to_preset",
+    "_resolve_auto_compact_override",
+    "_merge_prior_history",
+]
