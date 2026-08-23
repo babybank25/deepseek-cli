@@ -45,8 +45,10 @@ class AccountPool:
         self._registry_lock = asyncio.Lock()
         self._last_persist_at = 0.0
         self._persist_min_interval = 5.0
-        self._bindings = binding_store or ConversationBindingStore()
-        self._files = file_store or FileAffinityStore()
+        self._bindings = (
+            binding_store if binding_store is not None else ConversationBindingStore()
+        )
+        self._files = file_store if file_store is not None else FileAffinityStore()
 
     def load_all(self) -> int:
         names = AccountStore.list_accounts()
