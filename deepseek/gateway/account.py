@@ -1,10 +1,4 @@
-"""Single-account state and helpers.
-
-Each account owns a default client plus isolated per-conversation clients. The
-coarse account lock intentionally preserves the existing one-request-per-account
-behavior while preventing DeepSeek session lineage from leaking across logical
-conversations.
-"""
+"""Single-account state, isolated conversations, auth and quota helpers."""
 from __future__ import annotations
 
 import asyncio
@@ -14,14 +8,15 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
 
+from ..auth import AuthManager
 from ..client import APIClient
-from ..constants import DEFAULT_SYSTEM_PROMPT
+from ..constants import ACCOUNT_PROFILE_DIR, DEFAULT_SYSTEM_PROMPT
 from ..models import APIConfig
+from .store import AccountStore
 
 if TYPE_CHECKING:
     from .bindings import ConversationBinding
 
-# Error codes that indicate quota/rate-limit exhaustion.
 QUOTA_ERROR_CODES = {40400, 40401, 40402, 429}
 QUOTA_ERROR_MESSAGES = {
     "quota exceeded",
@@ -30,20 +25,19 @@ QUOTA_ERROR_MESSAGES = {
     "daily limit",
     "usage limit",
 }
-_QUOTA_CODE_PATTERNS = [re.compile(rf"\b{c}\b") for c in QUOTA_ERROR_CODES]
-
-# Exponential cooldown for repeat quota hits.
+_QUOTA_CODE_PATTERNS = [re.compile(rf"\b{code}\b") for code in QUOTA_ERROR_CODES]
 COOLDOWN_BASE_SECONDS = 60.0
 COOLDOWN_MAX_SECONDS = 3600.0
 
 
 @dataclass
 class Account:
-    """One DeepSeek account with isolated conversation clients and quota state."""
+    """One DeepSeek account with shared auth and isolated conversation clients."""
 
     name: str
     config: APIConfig
     client: APIClient = field(init=False)
+    auth_manager: AuthManager = field(init=False, repr=False)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
     _conversation_clients: dict[str, APIClient] = field(
         default_factory=dict,
@@ -59,10 +53,15 @@ class Account:
     last_error: Optional[str] = None
 
     def __post_init__(self) -> None:
+        self.auth_manager = AuthManager(
+            self.config,
+            persist=lambda config: AccountStore.save(self.name, config),
+            profile_dir=ACCOUNT_PROFILE_DIR / self.name,
+        )
         self.client = self._new_client()
 
     def _new_client(self) -> APIClient:
-        client = APIClient(self.config)
+        client = APIClient(self.config, auth_manager=self.auth_manager)
         client.system_prompt = DEFAULT_SYSTEM_PROMPT
         return client
 
@@ -71,13 +70,11 @@ class Account:
         conversation_id: Optional[str],
         binding: Optional["ConversationBinding"] = None,
     ) -> APIClient:
-        """Return isolated state for a conversation, hydrating persisted lineage."""
         if not conversation_id:
             return self.client
         existing = self._conversation_clients.get(conversation_id)
         if existing is not None:
             return existing
-
         client = self._new_client()
         if binding is not None and binding.session_id:
             client.session_id = binding.session_id
@@ -106,8 +103,6 @@ class Account:
     def conversation_clients(self) -> dict[str, APIClient]:
         return dict(self._conversation_clients)
 
-    # ── Availability ──────────────────────────────────────────
-
     @property
     def is_available(self) -> bool:
         return time.time() >= self.exhausted_until
@@ -116,10 +111,7 @@ class Account:
     def cooldown_remaining(self) -> float:
         return max(0.0, self.exhausted_until - time.time())
 
-    # ── State transitions ─────────────────────────────────────
-
     def mark_exhausted(self, cooldown_seconds: Optional[float] = None) -> float:
-        """Mark this account quota-exhausted with exponential backoff."""
         if cooldown_seconds is None:
             cooldown_seconds = min(
                 COOLDOWN_BASE_SECONDS * (2 ** self.consecutive_quota_hits),
@@ -140,15 +132,11 @@ class Account:
         self.total_errors += 1
         self.last_error = str(error)[:200]
 
-    # ── Classification ────────────────────────────────────────
-
     def is_quota_error(self, error: Exception) -> bool:
-        msg = str(error).lower()
-        if any(phrase in msg for phrase in QUOTA_ERROR_MESSAGES):
+        message = str(error).lower()
+        if any(phrase in message for phrase in QUOTA_ERROR_MESSAGES):
             return True
-        return any(pattern.search(msg) for pattern in _QUOTA_CODE_PATTERNS)
-
-    # ── Reporting ─────────────────────────────────────────────
+        return any(pattern.search(message) for pattern in _QUOTA_CODE_PATTERNS)
 
     def to_status_dict(self) -> dict:
         return {

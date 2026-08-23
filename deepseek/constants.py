@@ -5,36 +5,35 @@ All tuneable values live here — change once, applies everywhere.
 from pathlib import Path
 
 # ── Filesystem paths ──────────────────────────────────────────
-CONFIG_DIR  = Path.home() / ".deepseek_cli"
+CONFIG_DIR = Path.home() / ".deepseek_cli"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 PROFILE_DIR = CONFIG_DIR / "browser_profile"
+ACCOUNT_PROFILE_DIR = CONFIG_DIR / "browser_accounts"
 
 # ── Package root (for locating assets/) ──────────────────────
 PACKAGE_DIR = Path(__file__).resolve().parent
 
 # ── Version ───────────────────────────────────────────────────
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 # ── DeepSeek API paths ────────────────────────────────────────
-DEFAULT_TARGET_URL   = "https://chat.deepseek.com"
-COMPLETION_PATH      = "/api/v0/chat/completion"
-SESSION_PATH         = "/api/v0/chat_session/create"
-POW_CHALLENGE_PATH   = "/api/v0/chat/create_pow_challenge"
+DEFAULT_TARGET_URL = "https://chat.deepseek.com"
+COMPLETION_PATH = "/api/v0/chat/completion"
+SESSION_PATH = "/api/v0/chat_session/create"
+POW_CHALLENGE_PATH = "/api/v0/chat/create_pow_challenge"
+DEFAULT_POW_WORKER_URL = "https://fe-static.deepseek.com/chat/static/76608.8f2a9fa413.js"
 
 # ── Network resilience ────────────────────────────────────────
-MAX_RETRIES       = 3           # network retries per request
-RETRY_BACKOFF     = [1, 2, 4]  # seconds between retries
-POW_RETRY_LIMIT   = 2          # re-solve PoW on 40300/40301 before giving up
-REQUEST_TIMEOUT   = 90.0       # per-request timeout for API server (seconds)
+MAX_RETRIES = 3
+RETRY_BACKOFF = [1, 2, 4]
+POW_RETRY_LIMIT = 2
+REQUEST_TIMEOUT = 90.0
 
 # ── Auto-compact ─────────────────────────────────────────────
-# When a session reaches this many turns, the next call rolls a summary
-# into a fresh session so context survives without bloating the window.
-# Set to 0 to disable everywhere by default.
 AUTO_COMPACT_THRESHOLD = 20
 
 # ── Chat UX ───────────────────────────────────────────────────
-HISTORY_LIMIT = 100  # max messages kept in conversation_history (0 = unlimited)
+HISTORY_LIMIT = 100
 
 # ── Browser ───────────────────────────────────────────────────
 BROWSER_USER_AGENT = (
