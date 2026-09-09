@@ -656,6 +656,13 @@ class APIClient:
                     # Server emitted non-object payload (list/scalar) — skip
                     continue
 
+                if isinstance(data, dict) and data.get("type") == "error":
+                    err_content = data.get("content") or "DeepSeek upstream error"
+                    if data.get("finish_reason") == "context_length_exceeded":
+                        self.session_id = None
+                        self.last_message_id = None
+                    raise RuntimeError(f"{err_content}")
+
                 if current_event not in CONTENT_EVENTS:
                     continue
 
