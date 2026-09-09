@@ -177,6 +177,56 @@ async def test_missing_pow_challenge_with_stale_auth_raises_auth_error(monkeypat
         await client._generate_pow_token_for_path("/api/v0/chat/completion")
 
 
+@pytest.mark.asyncio
+async def test_missing_pow_challenge_when_protocol_unreachable_is_not_auth_error(monkeypatch):
+    client = APIClient(_config())
+
+    async def no_challenge(target_path=None):
+        return None
+
+    client._fetch_pow_challenge = no_challenge  # type: ignore[assignment]
+    unreachable = ProtocolCapabilities(
+        reachable=False,
+        auth_ok=False,
+        pow_ok=False,
+        pow_algorithm=None,
+        completion_path="/api/v0/chat/completion",
+        session_path="/api/v0/chat_session/create",
+        pow_challenge_path="/api/v0/chat/create_pow_challenge",
+        status_code=None,
+        error="connect timeout",
+    )
+    monkeypatch.setattr("deepseek.protocol.probe_protocol", _async_value(unreachable))
+
+    with pytest.raises(RuntimeError, match="protocol probe failed"):
+        await client._generate_pow_token_for_path("/api/v0/chat/completion")
+
+
+@pytest.mark.asyncio
+async def test_missing_pow_challenge_with_valid_auth_stays_pow_error(monkeypatch):
+    client = APIClient(_config())
+
+    async def no_challenge(target_path=None):
+        return None
+
+    client._fetch_pow_challenge = no_challenge  # type: ignore[assignment]
+    valid_auth = ProtocolCapabilities(
+        reachable=True,
+        auth_ok=True,
+        pow_ok=False,
+        pow_algorithm=None,
+        completion_path="/api/v0/chat/completion",
+        session_path="/api/v0/chat_session/create",
+        pow_challenge_path="/api/v0/chat/create_pow_challenge",
+        status_code=200,
+        error="challenge unavailable",
+    )
+    monkeypatch.setattr("deepseek.protocol.probe_protocol", _async_value(valid_auth))
+
+    with pytest.raises(RuntimeError, match="PoW challenge is unavailable"):
+        await client._generate_pow_token_for_path("/api/v0/chat/completion")
+
+
 def _async_value(value):
     async def inner(*args, **kwargs):
         return value

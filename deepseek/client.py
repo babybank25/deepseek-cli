@@ -156,18 +156,26 @@ class APIClient(_LegacyAPIClient):
         challenge = await self._fetch_pow_challenge(target_path=target_path)
         if not challenge:
             metrics.incr("pow_failed_total")
+            capabilities = None
             try:
                 from .protocol import probe_protocol
 
                 capabilities = await probe_protocol(self.config)
-                if not capabilities.auth_ok or capabilities.status_code in (401, 403):
+            except Exception:
+                pass
+
+            if capabilities is not None:
+                if capabilities.reachable and (
+                    not capabilities.auth_ok or capabilities.status_code in (401, 403)
+                ):
                     raise AuthExpiredError(
                         f"DeepSeek authentication expired or invalid: {capabilities.error or 'auth failed'}"
                     )
-            except AuthExpiredError:
-                raise
-            except Exception:
-                pass
+                if not capabilities.reachable:
+                    raise RuntimeError(
+                        "DeepSeek protocol probe failed: "
+                        f"{capabilities.error or 'upstream unreachable'}"
+                    )
             raise RuntimeError("DeepSeek PoW challenge is unavailable")
 
         algorithm = str(challenge.get("algorithm") or "")
