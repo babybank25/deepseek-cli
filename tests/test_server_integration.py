@@ -214,6 +214,63 @@ async def test_previous_response_replays_multiple_tool_outputs(monkeypatch, tmp_
 
 
 @pytest.mark.asyncio
+async def test_responses_stream_emits_created_delta_and_completed(monkeypatch, tmp_path):
+    async def fake_stream(self, _message):
+        yield ("text", "hello ")
+        yield ("text", "world")
+
+    app = await _capture_app(monkeypatch, tmp_path, stream_impl=fake_stream)
+    headers = {"Authorization": "Bearer secret"}
+    with TestClient(app) as client:
+        with client.stream(
+            "POST",
+            "/v1/responses",
+            headers=headers,
+            json={"model": "deepseek-chat", "input": "hello", "stream": True},
+        ) as response:
+            events = [line for line in response.iter_lines() if line.startswith("data: ")]
+
+    assert response.status_code == 200
+    joined = "\n".join(events)
+    assert "response.created" in joined
+    assert "response.output_text.delta" in joined
+    assert "hello " in joined
+    assert "world" in joined
+    assert "response.completed" in joined
+
+
+@pytest.mark.asyncio
+async def test_responses_tool_stream_buffers_split_tool_block(monkeypatch, tmp_path):
+    async def fake_stream(self, _message):
+        yield ("text", '<tool_call>{"name":"look')
+        yield ("text", 'up","arguments":{"q":1}}</tool_call>')
+
+    app = await _capture_app(monkeypatch, tmp_path, stream_impl=fake_stream)
+    headers = {"Authorization": "Bearer secret"}
+    with TestClient(app) as client:
+        with client.stream(
+            "POST",
+            "/v1/responses",
+            headers=headers,
+            json={
+                "model": "deepseek-chat",
+                "input": "lookup",
+                "stream": True,
+                "tools": [
+                    {"type": "function", "name": "lookup", "parameters": {"type": "object"}}
+                ],
+            },
+        ) as response:
+            events = [line for line in response.iter_lines() if line.startswith("data: ")]
+
+    joined = "\n".join(events)
+    assert "response.output_text.delta" not in joined
+    assert "response.output_item.added" in joined
+    assert '"type": "function_call"' in joined
+    assert '"name": "lookup"' in joined
+
+
+@pytest.mark.asyncio
 async def test_x_api_key_header_supported(monkeypatch, tmp_path):
     app = await _capture_app(monkeypatch, tmp_path)
     with TestClient(app) as client:
