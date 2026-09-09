@@ -30,3 +30,9 @@ runs/
 backup/
 *.log
 
+# AI tools & workspace indices
+.codegraph/
+.cursor/
+.serena/
+
+
