@@ -72,9 +72,19 @@ class FileAffinityStore:
         }
         self._save()
 
-    def account_for(self, file_ids: Optional[list[str]]) -> Optional[str]:
+    def account_for(
+        self,
+        file_ids: Optional[list[str]],
+        *,
+        require_all_known: bool = False,
+    ) -> Optional[str]:
         if not file_ids:
             return None
+
+        unknown = [file_id for file_id in file_ids if file_id not in self._items]
+        if require_all_known and unknown:
+            raise FileAffinityError(f"unknown file ID(s): {unknown}")
+
         accounts = {
             item["account_name"]
             for file_id in file_ids

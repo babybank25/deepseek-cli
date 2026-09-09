@@ -30,6 +30,15 @@ def test_file_affinity_roundtrip_and_conflict(tmp_path):
         loaded.account_for(["file-a", "file-b"])
 
 
+def test_file_affinity_can_require_every_file_to_be_known(tmp_path):
+    store = FileAffinityStore(path=tmp_path / "files.json")
+    store.bind("known", "a0")
+
+    assert store.account_for(["known", "unknown"]) == "a0"
+    with pytest.raises(FileAffinityError, match="unknown file"):
+        store.account_for(["known", "unknown"], require_all_known=True)
+
+
 @pytest.mark.asyncio
 async def test_file_affinity_forces_account_choice(tmp_path, monkeypatch):
     files = FileAffinityStore(path=tmp_path / "files.json")
@@ -85,4 +94,24 @@ async def test_unknown_file_id_fails_closed_with_multiple_accounts(tmp_path, mon
     monkeypatch.setattr("deepseek.client.APIClient.send_message_stream", stream)
     with pytest.raises(NoAccountAvailableError, match="unknown file"):
         async for _ in pool.send_message_stream("hello", file_ids=["legacy-file"]):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_mixed_known_and_unknown_file_fails_closed_with_multiple_accounts(tmp_path, monkeypatch):
+    files = FileAffinityStore(path=tmp_path / "files.json")
+    bindings = ConversationBindingStore(path=tmp_path / "bindings.json")
+    pool = AccountPool(binding_store=bindings, file_store=files)
+    pool._replace_accounts_for_test([Account("a0", _config()), Account("a1", _config())])
+    files.bind("known", "a0")
+
+    async def stream(self, _message):
+        yield ("text", "should-not-route")
+
+    monkeypatch.setattr("deepseek.client.APIClient.send_message_stream", stream)
+    with pytest.raises(NoAccountAvailableError, match="unknown file"):
+        async for _ in pool.send_message_stream(
+            "hello",
+            file_ids=["known", "unknown"],
+        ):
             pass
