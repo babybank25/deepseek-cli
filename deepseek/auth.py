@@ -41,10 +41,11 @@ class AuthManager:
 
     async def ensure_valid(self, *, force: bool = False) -> bool:
         """Probe saved auth, then open a visible browser only if recovery is needed."""
-        if self._validated and not force:
+        validated_before_wait = self._validated
+        if validated_before_wait and not force:
             return True
         async with self._lock:
-            if self._validated and not force:
+            if self._validated and (not force or not validated_before_wait):
                 return True
             capabilities = await probe_protocol(self.config)
             if capabilities.auth_ok and capabilities.pow_ok:
