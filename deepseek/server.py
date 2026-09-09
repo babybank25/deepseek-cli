@@ -936,6 +936,11 @@ async def serve_mode(
         if gateway_pool is not None
         else "single-account"
     )
+    if host.strip().lower() not in {"127.0.0.1", "localhost", "::1"}:
+        console.print(
+            "[yellow]Warning: API server is binding to a non-loopback address; "
+            "keep API authentication enabled and restrict network access.[/]"
+        )
     console.print(
         Panel.fit(
             f"[bold green]DeepSeek API Server[/] [dim]v{VERSION}[/]\n"

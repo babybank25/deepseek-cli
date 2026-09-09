@@ -57,22 +57,24 @@ OpenAI-compatible client and HTTP API for `chat.deepseek.com`. Built by reverse-
 ## Quick Start
 
 ```powershell
-pip install -r requirements.txt
+python -m pip install .
 playwright install chromium
 
 # 1. Capture your browser session (login + send a message in the popup window)
-python -m deepseek --discover
+deepseek --discover
 
 # 2a. Terminal chat
-python -m deepseek --chat
+deepseek --chat
 #    or just:
 python run.py                # interactive menu
 
 # 2b. OpenAI-compatible HTTP server
-python -m deepseek --serve --port 8000
+deepseek --serve --port 8000
 ```
 
-Point any OpenAI client at `http://127.0.0.1:8000/v1` and use it like the real OpenAI API.
+`python -m deepseek ...` remains equivalent when running directly from a source checkout.
+
+Point any OpenAI-compatible client at `http://127.0.0.1:8000/v1`. `/v1/*` routes require the local DeepSeek CLI API key generated at `~/.deepseek_cli/api_key`, unless `DEEPSEEK_API_KEY` or `--api-key` overrides it.
 
 ---
 
@@ -243,16 +245,36 @@ DeepSeek binds `model_type`, `thinking_enabled`, and `search_enabled` to the **s
 
 ## API Server
 
-```bash
+```powershell
 # Single account (default)
-python -m deepseek --serve --port 8000
+deepseek --serve --port 8000
 
 # Multi-account gateway (load every saved account)
-python -m deepseek --serve --gateway
+deepseek --serve --gateway
 
 # With auth + admin
-python -m deepseek --serve --api-key SECRET --admin-token ADMIN --auto-compact 30
+deepseek --serve --api-key SECRET --admin-token ADMIN --auto-compact 30
 ```
+
+Base URL: `http://127.0.0.1:8000/v1`
+
+The server always requires a **local API key** for `/v1/*`. By default it creates and reuses `~/.deepseek_cli/api_key`. `DEEPSEEK_API_KEY` and `--api-key` override that value. This local key authenticates clients to this server; it is **not** the DeepSeek Web browser token or cookie used upstream.
+
+### CLIProxyAPI
+
+Start the gateway with:
+
+```powershell
+deepseek --serve --gateway
+```
+
+Configure CLIProxyAPI with an **OpenAI-compatible upstream** using:
+
+- Base URL: `http://127.0.0.1:8000/v1`
+- API key: the contents of `~/.deepseek_cli/api_key`, or the same `DEEPSEEK_API_KEY` / `--api-key` override used to start this server
+- Models: `deepseek-chat`, `deepseek-fast`, `deepseek-reasoner`
+
+DeepSeek Web credentials remain private to DeepSeek CLI and must not be used as the local CLIProxyAPI API key.
 
 ### Endpoints
 
@@ -262,6 +284,7 @@ python -m deepseek --serve --api-key SECRET --admin-token ADMIN --auto-compact 3
 | `GET` | `/metrics` | Prometheus text exposition |
 | `GET` | `/v1/models` | OpenAI model list |
 | `POST` | `/v1/chat/completions` | OpenAI-compatible chat (stream/non-stream, tools, file_ids, conversation_id, auto_compact override) |
+| `POST` | `/v1/responses` | OpenAI Responses-compatible input/output, including `previous_response_id` tool continuation |
 | `GET` | `/v1/conversations` | list active multi-turn conversations |
 | `DELETE` | `/v1/conversations/{id}` | end a conversation, free its session |
 | `POST` | `/v1/conversations/{id}/compact` | force rolling-summary on a conversation |
@@ -286,14 +309,10 @@ The chat endpoint accepts standard OpenAI fields plus a few of our own:
 
 | Header | Meaning |
 |---|---|
-| `X-Model-Used` | echo of the requested model |
 | `X-Mode` | `single` or `gateway` |
-| `X-Tools-Active` | `1` if tool calling was emulated for this request |
 | `X-Request-Id` | trace id used in logs |
-| `X-Auto-Compact-Triggered` | `1` if rolling-summary fired during this request (non-stream only) |
-| `X-Auto-Compact-Available` | `1` on streamed responses (we cannot know mid-stream) |
+| `X-Conversation-Id` | server conversation identifier used for resumable history |
 | `X-Account-Used` | gateway: which account served the request |
-| `X-Conversation-Ignored` | set to `tools-mode-is-stateless` when both `tools` and `conversation_id` were sent |
 | `Retry-After` | gateway: seconds until soonest cooldown ends (on 503) |
 
 ---
@@ -313,9 +332,11 @@ DeepSeek's web API has **no native function-calling protocol**. We emulate it vi
 For the client: just use the OpenAI SDK's `tools` parameter; it works.
 
 ```python
+from pathlib import Path
 from openai import OpenAI
 
-client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="anything")
+api_key = (Path.home() / ".deepseek_cli" / "api_key").read_text().strip()
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key=api_key)
 resp = client.chat.completions.create(
     model="deepseek-chat",
     messages=[{"role": "user", "content": "What's the weather in Bangkok?"}],
@@ -329,7 +350,7 @@ print(resp.choices[0].message.tool_calls)
 ### Limitations
 
 * Streaming for tools mode buffers the entire reply, then emits a single delta with `tool_calls`. This is unavoidable: we need the whole text to detect `<tool_call>` blocks.
-* `conversation_id` is silently ignored when `tools` is set. The server returns header `X-Conversation-Ignored: tools-mode-is-stateless` so the client knows.
+* Tool mode uses a fresh upstream DeepSeek session. OpenAI conversation continuity is preserved by persisting and replaying canonical message/tool history rather than by reusing the upstream session.
 
 ---
 
@@ -371,7 +392,7 @@ So the model keeps long-term context without keeping ever-growing token windows.
 
 `AccountPool` (in `deepseek/gateway/pool.py`) routes a request to the best available account:
 
-* **Scoring**: `(busy?, consecutive_quota_hits, total_errors, last_used, random_jitter)` — lower is better. Selecting under per-account locks means parallel requests can use *different* accounts simultaneously while DeepSeek's stateful session remains single-writer.
+* **Scoring**: `(busy?, consecutive_quota_hits, last_used, random_jitter)` — lower is better. Historical `total_errors` remains observable but does not permanently penalize a recovered account. Selecting under per-account locks means parallel requests can use *different* accounts simultaneously while DeepSeek's stateful session remains single-writer.
 * **Exponential cooldown**: 60s → 120s → 240s → ... capped at 1h per account. Reset to 0 on any successful request.
 * **Failover**: on quota-class errors (HTTP 429, codes `40400/40401/40402`, message contains `quota`/`rate limit`/...) the account is excluded from this request and the pool retries with the next-best one — *as long as we haven't streamed any tokens to the caller yet* (no duplicate output).
 * **Persistence**: cooldowns + counters land in `~/.deepseek_cli/pool_stats.json` so a restart doesn't lose track.
@@ -644,8 +665,8 @@ These are the places that have broken in the past — patch carefully.
 * **Synthetic streaming for tool calls** — the OpenAI standard streams `delta.tool_calls` incrementally; we buffer and emit one consolidated chunk.
 * **No Anthropic `/v1/messages` endpoint** — only OpenAI-compatible. Use Claude Code in OpenAI-mode (`OPENAI_BASE_URL` env var).
 * **Metrics reset on restart** — by design. The state file `pool_stats.json` exists for cooldown info, not metrics.
-* **Single binary, no daemon mode** — the server runs in the foreground. Use `nssm` / `systemd` if you want it as a service.
-* **Browser sessions expire** — no automatic re-auth flow. Re-run `--discover` when `/status` shows the token expired.
+* **Foreground server, no daemon mode** — the server runs in the foreground. Use `nssm` / `systemd` if you want it as a service.
+* **Interactive recovery can still be required** — saved auth is probed automatically. When it is stale, `AuthManager` attempts serialized browser recovery and persists only validated credentials. Use `--repair` when automatic recovery cannot restore the session.
 
 ---
 

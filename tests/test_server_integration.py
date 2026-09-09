@@ -23,7 +23,7 @@ def _config() -> APIConfig:
     )
 
 
-async def _capture_app(monkeypatch, tmp_path, stream_impl=None):
+async def _capture_app(monkeypatch, tmp_path, stream_impl=None, **serve_kwargs):
     captured = {}
     monkeypatch.setattr(server_module.SessionManager, "load_config", lambda: _config())
     monkeypatch.setattr(
@@ -55,7 +55,7 @@ async def _capture_app(monkeypatch, tmp_path, stream_impl=None):
             return None
 
     monkeypatch.setattr(uvicorn, "Server", FakeServer)
-    await server_module.serve_mode()
+    await server_module.serve_mode(**serve_kwargs)
     return captured["app"]
 
 
@@ -276,3 +276,13 @@ async def test_x_api_key_header_supported(monkeypatch, tmp_path):
     with TestClient(app) as client:
         response = client.get("/v1/models", headers={"x-api-key": "secret"})
         assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_non_loopback_bind_warns_operator(monkeypatch, tmp_path):
+    printed = []
+    monkeypatch.setattr(server_module.console, "print", lambda value: printed.append(str(value)))
+
+    await _capture_app(monkeypatch, tmp_path, host="0.0.0.0")
+
+    assert any("non-loopback" in value.lower() for value in printed)
