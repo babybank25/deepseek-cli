@@ -211,16 +211,20 @@ class TestAccountPoolNextAccount:
         assert first is not None
         assert first.name in ("a0", "a1")
 
-    def test_prefers_idle_with_fewer_errors(self):
-        """Scoring prefers accounts with fewer total errors."""
+    def test_prefers_least_recently_used_when_current_health_is_equal(self):
         pool = AccountPool()
-        a0 = _make_account("a0")
-        a0.total_errors = 10
-        a1 = _make_account("a1")
-        a1.total_errors = 0
-        pool._replace_accounts_for_test([a0, a1])
-        # a1 should win (fewer errors)
-        assert pool._next_account().name == "a1"
+        recovered = _make_account("recovered")
+        recovered.total_errors = 100
+        recovered.consecutive_quota_hits = 0
+        recovered.last_used = 1.0
+
+        recent = _make_account("recent")
+        recent.total_errors = 0
+        recent.consecutive_quota_hits = 0
+        recent.last_used = 2.0
+
+        pool._replace_accounts_for_test([recovered, recent])
+        assert pool._next_account().name == "recovered"
 
 
 class TestAccountPoolStatus:
@@ -302,6 +306,30 @@ class TestAccountPoolNoAvailableError:
         with pytest.raises(NoAccountAvailableError):
             import asyncio as _aio
             _aio.run(run())
+
+
+@pytest.mark.asyncio
+async def test_stateless_quota_failure_fails_over_before_output(monkeypatch):
+    pool = AccountPool()
+    a0 = _make_account("a0")
+    a1 = _make_account("a1")
+    a0.last_used = 0.0
+    a1.last_used = 1.0
+    pool._replace_accounts_for_test([a0, a1])
+
+    async def stream(self, _message):
+        if self is a0.client:
+            raise RuntimeError("quota exceeded")
+        yield ("text", "from-a1")
+
+    monkeypatch.setattr("deepseek.client.APIClient.send_message_stream", stream)
+
+    output = []
+    async for token in pool.send_message_stream("hello"):
+        output.append(token)
+
+    assert output == [("text", "from-a1")]
+    assert a0.consecutive_quota_hits == 1
 
 
 class TestAccountPoolPresetIsolation:

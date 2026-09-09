@@ -158,7 +158,6 @@ class AccountPool:
         return (
             1 if account.lock.locked() else 0,
             account.consecutive_quota_hits,
-            account.total_errors,
             account.last_used,
             random.random(),
         )
