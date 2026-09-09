@@ -317,6 +317,8 @@ class TestAccountPoolPresetIsolation:
         # Force pool to pick a0 by making a1 less attractive
         a1.total_errors = 100
         pool._replace_accounts_for_test([a0, a1])
+        pool._files.bind("f1", "a0")
+        pool._files.bind("f2", "a0")
 
         # Mock both clients' send_message_stream to immediately complete
         async def fake_stream(_msg):

@@ -527,9 +527,15 @@ async def serve_mode(
         prior_history = prior_state.history if prior_state is not None else []
         effective_messages = _merge_prior_history(prior_history, messages)
 
+        has_tool_history = any(
+            m.get("role") == "tool" or bool(m.get("tool_calls"))
+            for m in effective_messages
+        )
+        tools_stateless = tools_active or has_tool_history
+
         if tools_active:
             prompt = compose_tools_prompt(effective_messages, tools)
-        elif resolution.is_new and len(effective_messages) > 1:
+        elif has_tool_history or (resolution.is_new and len(effective_messages) > 1):
             prompt = messages_to_prompt(effective_messages)
         else:
             prompt = _messages_to_prompt(effective_messages)
@@ -546,14 +552,14 @@ async def serve_mode(
         response_id = f"resp_{uuid.uuid4().hex}"
         created = int(time.time())
         chosen: dict[str, object] = {"client": None, "account": None}
-        transport_conversation = None if tools_active else conversation_id
+        transport_conversation = None if tools_stateless else conversation_id
 
         def remember_choice(account, client) -> None:
             chosen["account"] = account
             chosen["client"] = client
             client.system_prompt = (
                 DEFAULT_SYSTEM_PROMPT
-                if tools_active
+                if tools_stateless
                 else _recovery_system_prompt(prior_state)
             )
 
@@ -587,7 +593,7 @@ async def serve_mode(
                     raise HTTPException(status_code=status, detail=detail) from error
                 return
 
-            if tools_active:
+            if tools_stateless:
                 client = default_client
                 lock = default_lock
                 state = None
@@ -613,11 +619,11 @@ async def serve_mode(
                 if auto_compact is not None:
                     previous_threshold = client.auto_compact_threshold
                     client.auto_compact_threshold = auto_compact
-                if reset_session or tools_active:
+                if reset_session or tools_stateless:
                     await client.reset_session()
                 client.system_prompt = (
                     DEFAULT_SYSTEM_PROMPT
-                    if tools_active
+                    if tools_stateless
                     else _recovery_system_prompt(state)
                 )
                 if file_ids:
@@ -662,7 +668,7 @@ async def serve_mode(
             model_type = preset["model_type"]
             thinking_enabled = bool(preset["thinking_enabled"])
             search_enabled = bool(preset["search_enabled"])
-            if isinstance(client, APIClient) and not tools_active:
+            if isinstance(client, APIClient) and not tools_stateless:
                 session_id = client.session_id
                 parent_id = client.last_message_id
                 model_type = client.model_type

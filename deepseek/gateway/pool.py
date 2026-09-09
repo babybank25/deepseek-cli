@@ -250,6 +250,10 @@ class AccountPool:
             file_account = self._files.account_for(file_ids)
         except FileAffinityError as error:
             raise NoAccountAvailableError(str(error)) from error
+        if file_ids and file_account is None and len(self._accounts) > 1:
+            raise NoAccountAvailableError(
+                f"Cannot route unknown file {file_ids} safely with multiple accounts configured"
+            )
         if binding is not None and file_account and binding.account_name != file_account:
             raise NoAccountAvailableError(
                 f"Conversation '{conversation_id}' is pinned to '{binding.account_name}' "
