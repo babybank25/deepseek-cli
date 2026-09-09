@@ -25,6 +25,12 @@ jobs:
           cache: pip
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
+      - name: Install project package
+        run: python -m pip install .
+      - name: Smoke test installed CLI
+        run: |
+          deepseek --version
+          python -m deepseek --version
       - name: Verify dependency graph
         run: python -m pip check
       - name: Compile Python sources
