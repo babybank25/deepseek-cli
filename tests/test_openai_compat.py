@@ -82,3 +82,37 @@ def test_tool_recovery_prompt_keeps_original_request():
     prompt = build_tool_recovery_prompt("ORIGINAL")
     assert prompt.startswith("ORIGINAL")
     assert "Retry once" in prompt
+
+
+def test_responses_developer_message_normalizes_to_system():
+    chat = responses_request_to_chat(
+        {
+            "input": [
+                {"type": "message", "role": "developer", "content": "follow project rules"},
+                {"type": "message", "role": "user", "content": "hello"},
+            ]
+        }
+    )
+    assert chat["messages"][0] == {"role": "system", "content": "follow project rules"}
+    assert chat["messages"][1] == {"role": "user", "content": "hello"}
+
+
+def test_responses_function_call_output_preserves_call_id_and_content():
+    chat = responses_request_to_chat(
+        {
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-weather",
+                    "output": "sunny 32C",
+                }
+            ]
+        }
+    )
+    assert chat["messages"] == [
+        {
+            "role": "tool",
+            "tool_call_id": "call-weather",
+            "content": "sunny 32C",
+        }
+    ]

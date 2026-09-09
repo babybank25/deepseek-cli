@@ -161,6 +161,59 @@ async def test_previous_response_replays_stateless_tool_history(monkeypatch, tmp
 
 
 @pytest.mark.asyncio
+async def test_previous_response_replays_multiple_tool_outputs(monkeypatch, tmp_path):
+    prompts = []
+
+    async def fake_stream(self, message):
+        prompts.append(message)
+        if len(prompts) == 1:
+            yield (
+                "text",
+                '<tool_call>{"name":"weather","arguments":{"city":"Bangkok"}}</tool_call>'
+                '<tool_call>{"name":"time","arguments":{"city":"Bangkok"}}</tool_call>',
+            )
+        else:
+            yield ("text", "done")
+
+    app = await _capture_app(monkeypatch, tmp_path, stream_impl=fake_stream)
+    headers = {"Authorization": "Bearer secret"}
+    with TestClient(app) as client:
+        first = client.post(
+            "/v1/responses",
+            headers=headers,
+            json={
+                "model": "deepseek-chat",
+                "input": "Plan my morning",
+                "tools": [
+                    {"type": "function", "name": "weather", "parameters": {"type": "object"}},
+                    {"type": "function", "name": "time", "parameters": {"type": "object"}},
+                ],
+            },
+        )
+        calls = [item for item in first.json()["output"] if item["type"] == "function_call"]
+        assert len(calls) == 2
+
+        second = client.post(
+            "/v1/responses",
+            headers=headers,
+            json={
+                "model": "deepseek-chat",
+                "previous_response_id": first.json()["id"],
+                "input": [
+                    {"type": "function_call_output", "call_id": calls[0]["call_id"], "output": "sunny"},
+                    {"type": "function_call_output", "call_id": calls[1]["call_id"], "output": "08:00"},
+                ],
+            },
+        )
+
+    assert second.status_code == 200
+    assert "weather" in prompts[1]
+    assert "time" in prompts[1]
+    assert "sunny" in prompts[1]
+    assert "08:00" in prompts[1]
+
+
+@pytest.mark.asyncio
 async def test_x_api_key_header_supported(monkeypatch, tmp_path):
     app = await _capture_app(monkeypatch, tmp_path)
     with TestClient(app) as client:
