@@ -14,6 +14,22 @@ from deepseek.exceptions import AuthExpiredError, _PowExpiredError, _SessionNotF
 from deepseek.models import APIConfig
 
 
+@pytest.fixture(autouse=True)
+def _close_pytest_asyncio_clean_loop_before_sync_tests(request):
+    """Prevent sync asyncio.run() tests from orphaning pytest-asyncio's clean loop."""
+    if request.node.get_closest_marker("asyncio") is not None:
+        return
+    policy = asyncio.get_event_loop_policy()
+    try:
+        loop = policy.get_event_loop()
+    except RuntimeError:
+        return
+    if loop.is_running() or loop.is_closed():
+        return
+    loop.close()
+    policy.set_event_loop(None)
+
+
 def _make_config(**overrides) -> APIConfig:
     base = {
         "target_url": "https://chat.deepseek.com",
@@ -574,7 +590,8 @@ class TestModeChangeResetsSession:
 # ── upload_file ───────────────────────────────────────────────
 
 class TestUploadFile:
-    def test_returns_file_id_from_biz_data(self):
+    @pytest.mark.asyncio
+    async def test_returns_file_id_from_biz_data(self):
         client = APIClient(_make_config())
 
         async def fake_pow(_path):
@@ -585,14 +602,19 @@ class TestUploadFile:
         mock_resp.status_code = 200
         mock_resp.json = MagicMock(return_value={"data": {"biz_data": {"id": "f_123"}}})
 
-        async def run():
+        try:
             with patch.object(client.client, "post", AsyncMock(return_value=mock_resp)):
-                return await client.upload_file(b"hello", "x.txt", "text/plain")
+                assert await client.upload_file(b"hello", "x.txt", "text/plain") == "f_123"
+        finally:
+            await client.close()
 
-        assert asyncio.run(run()) == "f_123"
-
-    def test_raises_auth_on_401(self):
-        client = APIClient(_make_config())
+    @pytest.mark.asyncio
+    async def test_raises_auth_on_401(self):
+        auth = MagicMock()
+        auth.invalidate = MagicMock()
+        auth.recover = AsyncMock(return_value=False)
+        auth.ensure_valid = AsyncMock(return_value=False)
+        client = APIClient(_make_config(), auth_manager=auth)
 
         async def fake_pow(_path):
             return ""
@@ -602,14 +624,16 @@ class TestUploadFile:
         mock_resp.status_code = 401
         mock_resp.text = "unauthorized"
 
-        async def run():
+        try:
             with patch.object(client.client, "post", AsyncMock(return_value=mock_resp)):
-                await client.upload_file(b"x", "f.txt")
+                with pytest.raises(AuthExpiredError):
+                    await client.upload_file(b"x", "f.txt")
+            auth.recover.assert_awaited_once()
+        finally:
+            await client.close()
 
-        with pytest.raises(AuthExpiredError):
-            asyncio.run(run())
-
-    def test_raises_runtime_when_no_file_id(self):
+    @pytest.mark.asyncio
+    async def test_raises_runtime_when_no_file_id(self):
         client = APIClient(_make_config())
 
         async def fake_pow(_path):
@@ -620,12 +644,12 @@ class TestUploadFile:
         mock_resp.status_code = 200
         mock_resp.json = MagicMock(return_value={"data": {}})
 
-        async def run():
+        try:
             with patch.object(client.client, "post", AsyncMock(return_value=mock_resp)):
-                await client.upload_file(b"x", "f.txt")
-
-        with pytest.raises(RuntimeError, match="file_id"):
-            asyncio.run(run())
+                with pytest.raises(RuntimeError, match="file_id"):
+                    await client.upload_file(b"x", "f.txt")
+        finally:
+            await client.close()
 
 
 # ── Backoff jitter ────────────────────────────────────────────

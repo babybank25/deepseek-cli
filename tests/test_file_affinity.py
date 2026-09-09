@@ -46,7 +46,8 @@ async def test_file_affinity_forces_account_choice(tmp_path, monkeypatch):
     pool = AccountPool(binding_store=bindings, file_store=files)
     a0 = Account("a0", _config())
     a1 = Account("a1", _config())
-    a0.total_errors = 999
+    a0.last_used = 999.0
+    a1.last_used = 0.0
     pool._replace_accounts_for_test([a0, a1])
     files.bind("file-a", "a0")
 

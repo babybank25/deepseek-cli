@@ -92,7 +92,8 @@ async def test_gateway_pins_conversation_to_first_successful_account(tmp_path, m
     pool = AccountPool(binding_store=store)
     a0 = _account("a0")
     a1 = _account("a1")
-    a1.total_errors = 100
+    a0.last_used = 0.0
+    a1.last_used = 1.0
     pool._replace_accounts_for_test([a0, a1])
 
     async def fake_stream(self, _message):
@@ -111,9 +112,9 @@ async def test_gateway_pins_conversation_to_first_successful_account(tmp_path, m
         pass
     assert chosen == ["a0"]
 
-    # Make the other account look much healthier. Affinity must still win.
-    a0.total_errors = 999
-    a1.total_errors = 0
+    # Make the other account the scheduler's preferred choice. Affinity must still win.
+    a0.last_used = 999.0
+    a1.last_used = 0.0
     chosen.clear()
     async for _ in pool.send_message_stream(
         "second",
@@ -131,7 +132,8 @@ async def test_bound_conversation_never_silently_migrates_on_quota(tmp_path, mon
     pool = AccountPool(binding_store=store)
     a0 = _account("a0")
     a1 = _account("a1")
-    a1.total_errors = 100
+    a0.last_used = 0.0
+    a1.last_used = 1.0
     pool._replace_accounts_for_test([a0, a1])
 
     async def ok_stream(self, _message):
@@ -144,7 +146,6 @@ async def test_bound_conversation_never_silently_migrates_on_quota(tmp_path, mon
         pass
 
     a0.exhausted_until = time.time() + 60
-    a1.total_errors = 0
     with pytest.raises(NoAccountAvailableError) as exc:
         async for _ in pool.send_message_stream("second", conversation_id="conv-1"):
             pass

@@ -6,7 +6,7 @@ filterwarnings = [
     # Surface anything new as an error so we don't accumulate cruft.
     "error",
     # Allow the one warning we cannot fix here (uvloop on Windows).
-    "default::ResourceWarning",
+    "error::ResourceWarning",
     # Upstream deprecation in starlette/anyio 4.15+
     "ignore::DeprecationWarning:starlette.*:",
     "ignore:.*BlockingPortal.*:DeprecationWarning",

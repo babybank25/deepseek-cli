@@ -1,4 +1,5 @@
 """Tests for deepseek.gateway — AccountStore, Account, AccountPool."""
+import asyncio
 import json
 import sys
 import time
@@ -294,18 +295,15 @@ class TestAccountPoolNoAvailableError:
         assert exc_info.value.retry_after is not None
         assert 25 <= exc_info.value.retry_after <= 31
 
-    def test_empty_pool_raises_immediately(self):
+    @pytest.mark.asyncio
+    async def test_empty_pool_raises_immediately(self):
         from deepseek.gateway.pool import NoAccountAvailableError
 
         pool = AccountPool()
 
-        async def run():
+        with pytest.raises(NoAccountAvailableError):
             async for _ in pool.send_message_stream("hi"):
                 pass
-
-        with pytest.raises(NoAccountAvailableError):
-            import asyncio as _aio
-            _aio.run(run())
 
 
 @pytest.mark.asyncio
@@ -333,17 +331,14 @@ async def test_stateless_quota_failure_fails_over_before_output(monkeypatch):
 
 
 class TestAccountPoolPresetIsolation:
-    def test_preset_only_applies_to_chosen_account(self):
+    @pytest.mark.asyncio
+    async def test_preset_only_applies_to_chosen_account(self):
         """Pool must apply preset/file_ids ONLY to the account it picks,
         not to every account in the pool. This prevents cross-request
         mutation when many requests are in flight at once."""
-        import asyncio as _aio
-
         pool = AccountPool()
         a0 = _make_account("a0")
         a1 = _make_account("a1")
-        # Force pool to pick a0 by making a1 less attractive
-        a1.total_errors = 100
         pool._replace_accounts_for_test([a0, a1])
         pool._files.bind("f1", "a0")
         pool._files.bind("f2", "a0")
@@ -355,18 +350,16 @@ class TestAccountPoolPresetIsolation:
         a0.client.send_message_stream = lambda msg: fake_stream(msg)  # type: ignore[assignment]
         a1.client.send_message_stream = lambda msg: fake_stream(msg)  # type: ignore[assignment]
 
-        async def run():
-            async for _ in pool.send_message_stream(
-                "hi",
-                model_preset={
-                    "model_type": "expert",
-                    "thinking_enabled": True,
-                    "search_enabled": False,
-                },
-                file_ids=["f1", "f2"],
-            ):
-                pass
-        _aio.run(run())
+        async for _ in pool.send_message_stream(
+            "hi",
+            model_preset={
+                "model_type": "expert",
+                "thinking_enabled": True,
+                "search_enabled": False,
+            },
+            file_ids=["f1", "f2"],
+        ):
+            pass
 
         # a0 was chosen → preset applied
         assert a0.client.model_type == "expert"
@@ -397,12 +390,13 @@ class TestPoolFlushStats:
 
 
 class TestPoolOnAccountChosenCallback:
-    def test_callback_invoked_with_account(self):
-        import asyncio as _aio
+    @pytest.mark.asyncio
+    async def test_callback_invoked_with_account(self):
         p = AccountPool()
         a0 = _make_account("a0")
         a1 = _make_account("a1")
-        a1.total_errors = 100  # make a0 win the score
+        a0.last_used = 0.0
+        a1.last_used = 1.0
         p._replace_accounts_for_test([a0, a1])
 
         seen: list[str] = []
@@ -412,19 +406,16 @@ class TestPoolOnAccountChosenCallback:
                 yield None
         a0.client.send_message_stream = lambda msg: fake_stream(msg)  # type: ignore[assignment]
 
-        async def run():
-            async for _ in p.send_message_stream(
-                "hi",
-                on_account_chosen=lambda acc: seen.append(acc.name),
-            ):
-                pass
-
-        _aio.run(run())
+        async for _ in p.send_message_stream(
+            "hi",
+            on_account_chosen=lambda acc: seen.append(acc.name),
+        ):
+            pass
         assert seen == ["a0"]
 
-    def test_callback_exception_swallowed(self):
+    @pytest.mark.asyncio
+    async def test_callback_exception_swallowed(self):
         """A buggy callback must not break the request flow."""
-        import asyncio as _aio
         p = AccountPool()
         a0 = _make_account("a0")
         p._replace_accounts_for_test([a0])
@@ -437,11 +428,9 @@ class TestPoolOnAccountChosenCallback:
         def boom(_acc):
             raise RuntimeError("callback bug")
 
-        async def run():
-            async for _ in p.send_message_stream("hi", on_account_chosen=boom):
-                pass
         # Should NOT raise — pool catches callback exceptions.
-        _aio.run(run())
+        async for _ in p.send_message_stream("hi", on_account_chosen=boom):
+            pass
 
 
 class TestPoolPersistThrottle:
@@ -479,19 +468,13 @@ class TestPoolPersistThrottle:
 
 
 class TestAccountLockReset:
-    def test_lock_can_be_replaced(self):
+    @pytest.mark.asyncio
+    async def test_lock_can_be_replaced(self):
         """Admin unblock heuristic — replacing the lock object recovers
         from a never-released lock without breaking the account."""
-        import asyncio as _aio
-
         acc = _make_account("stuck")
-        # Simulate a lock that was acquired but never released.
-        loop = _aio.new_event_loop()
-        try:
-            loop.run_until_complete(acc.lock.acquire())
-            assert acc.lock.locked() is True
-            # Replace the lock — what the admin endpoint does.
-            acc.lock = _aio.Lock()
-            assert acc.lock.locked() is False
-        finally:
-            loop.close()
+        await acc.lock.acquire()
+        assert acc.lock.locked() is True
+
+        acc.lock = asyncio.Lock()
+        assert acc.lock.locked() is False
