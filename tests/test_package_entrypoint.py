@@ -3,6 +3,13 @@ from unittest.mock import patch
 import deepseek.__main__ as cli_main
 
 
+def test_parser_accepts_gateway_routing_strategy():
+    args = cli_main.build_parser().parse_args(
+        ["--serve", "--gateway", "--routing-strategy", "fill-first"]
+    )
+    assert args.routing_strategy == "fill-first"
+
+
 def test_run_executes_async_main_once():
     with patch("deepseek.__main__.asyncio.run") as run_async:
         cli_main.run()

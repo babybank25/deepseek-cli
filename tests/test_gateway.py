@@ -10,7 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from deepseek.gateway.account import Account
+from deepseek.gateway.account import Account, sanitize_error_summary
 from deepseek.gateway.pool import AccountPool
 from deepseek.gateway.store import AccountStore
 from deepseek.models import APIConfig
@@ -131,6 +131,21 @@ class TestAccountMarkExhausted:
         acc.mark_exhausted()
         assert acc.total_errors == 1
 
+    def test_mark_exhausted_uses_explicit_retry_after(self):
+        acc = _make_account()
+        cooldown = acc.mark_exhausted(cooldown_seconds=7.5)
+        assert cooldown == 7.5
+        assert 6.5 <= acc.cooldown_remaining <= 7.5
+
+    def test_mark_exhausted_redacts_error_summary(self):
+        acc = _make_account()
+        acc.mark_exhausted(
+            cooldown_seconds=10,
+            error=RuntimeError("Authorization: Bearer secret-token-123"),
+        )
+        assert "secret-token-123" not in (acc.last_error or "")
+        assert "[REDACTED]" in (acc.last_error or "")
+
 
 class TestAccountIsQuotaError:
     def test_detects_rate_limit_message(self):
@@ -213,7 +228,7 @@ class TestAccountPoolNextAccount:
         assert first.name in ("a0", "a1")
 
     def test_prefers_least_recently_used_when_current_health_is_equal(self):
-        pool = AccountPool()
+        pool = AccountPool(routing_strategy="least-used")
         recovered = _make_account("recovered")
         recovered.total_errors = 100
         recovered.consecutive_quota_hits = 0
@@ -226,6 +241,48 @@ class TestAccountPoolNextAccount:
 
         pool._replace_accounts_for_test([recovered, recent])
         assert pool._next_account().name == "recovered"
+
+    def test_round_robin_rotates_in_stable_account_order(self):
+        pool = AccountPool(routing_strategy="round-robin")
+        pool._replace_accounts_for_test([
+            _make_account("a2"),
+            _make_account("a0"),
+            _make_account("a1"),
+        ])
+
+        assert [pool._next_account().name for _ in range(5)] == [
+            "a0", "a1", "a2", "a0", "a1"
+        ]
+
+    def test_round_robin_continues_after_candidate_set_shrinks(self):
+        pool = AccountPool(routing_strategy="round-robin")
+        a0 = _make_account("a0")
+        a1 = _make_account("a1")
+        a2 = _make_account("a2")
+        pool._replace_accounts_for_test([a0, a1, a2])
+
+        assert pool._next_account().name == "a0"
+        assert pool._next_account().name == "a1"
+        a1.exhausted_until = time.time() + 60
+        assert pool._next_account().name == "a2"
+        a1.exhausted_until = 0.0
+        assert pool._next_account().name == "a0"
+        assert pool._next_account().name == "a1"
+
+    def test_fill_first_uses_first_available_account_until_unavailable(self):
+        pool = AccountPool(routing_strategy="fill-first")
+        a0 = _make_account("a0")
+        a1 = _make_account("a1")
+        pool._replace_accounts_for_test([a1, a0])
+
+        assert pool._next_account().name == "a0"
+        assert pool._next_account().name == "a0"
+        a0.exhausted_until = time.time() + 60
+        assert pool._next_account().name == "a1"
+
+    def test_invalid_routing_strategy_is_rejected(self):
+        with pytest.raises(ValueError, match="routing strategy"):
+            AccountPool(routing_strategy="random-magic")
 
 
 class TestAccountPoolStatus:
@@ -240,6 +297,7 @@ class TestAccountPoolStatus:
         assert isinstance(s["accounts"], list)
         assert len(s["accounts"]) == 2
         assert s["accounts"][0]["name"] == "account_0"
+        assert s["routing_strategy"] == "round-robin"
 
     def test_status_counts_exhausted_correctly(self):
         pool = AccountPool()
@@ -478,3 +536,16 @@ class TestAccountLockReset:
 
         acc.lock = asyncio.Lock()
         assert acc.lock.locked() is False
+
+
+def test_sanitize_error_summary_redacts_common_credentials():
+    raw = (
+        "Authorization: Bearer super-secret-token; "
+        "https://example.test/path?access_token=abc123&x=1; "
+        "Cookie: sessionid=cookie-secret"
+    )
+    sanitized = sanitize_error_summary(raw)
+    assert "super-secret-token" not in sanitized
+    assert "abc123" not in sanitized
+    assert "cookie-secret" not in sanitized
+    assert sanitized.count("[REDACTED]") >= 3

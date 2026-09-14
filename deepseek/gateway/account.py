@@ -28,6 +28,20 @@ QUOTA_ERROR_MESSAGES = {
 _QUOTA_CODE_PATTERNS = [re.compile(rf"\b{code}\b") for code in QUOTA_ERROR_CODES]
 COOLDOWN_BASE_SECONDS = 60.0
 COOLDOWN_MAX_SECONDS = 3600.0
+_AUTH_HEADER_PATTERN = re.compile(r"(?i)\b(authorization\s*[:=]\s*)(?:bearer\s+|basic\s+)?[^\s;,]+")
+_SECRET_PARAM_PATTERN = re.compile(
+    r"(?i)([?&](?:access_token|refresh_token|api_key|apikey|token|secret|password)=)[^&\s;,]+"
+)
+_COOKIE_PATTERN = re.compile(r"(?i)\b((?:set-)?cookie\s*:\s*)[^\r\n;]+(?:;[^\r\n]*)?")
+
+
+def sanitize_error_summary(value: object, limit: int = 200) -> str:
+    """Return a compact error string with common credentials removed."""
+    text = str(value).strip()
+    text = _AUTH_HEADER_PATTERN.sub(r"\1[REDACTED]", text)
+    text = _SECRET_PARAM_PATTERN.sub(r"\1[REDACTED]", text)
+    text = _COOKIE_PATTERN.sub(r"\1[REDACTED]", text)
+    return text[:limit]
 
 
 @dataclass
@@ -111,15 +125,22 @@ class Account:
     def cooldown_remaining(self) -> float:
         return max(0.0, self.exhausted_until - time.time())
 
-    def mark_exhausted(self, cooldown_seconds: Optional[float] = None) -> float:
+    def mark_exhausted(
+        self,
+        cooldown_seconds: Optional[float] = None,
+        error: Optional[Exception] = None,
+    ) -> float:
         if cooldown_seconds is None:
             cooldown_seconds = min(
                 COOLDOWN_BASE_SECONDS * (2 ** self.consecutive_quota_hits),
                 COOLDOWN_MAX_SECONDS,
             )
+        cooldown_seconds = max(0.0, min(float(cooldown_seconds), COOLDOWN_MAX_SECONDS))
         self.exhausted_until = time.time() + cooldown_seconds
         self.consecutive_quota_hits += 1
         self.total_errors += 1
+        if error is not None:
+            self.last_error = sanitize_error_summary(error)
         return cooldown_seconds
 
     def mark_success(self) -> None:
@@ -130,7 +151,7 @@ class Account:
 
     def mark_error(self, error: Exception) -> None:
         self.total_errors += 1
-        self.last_error = str(error)[:200]
+        self.last_error = sanitize_error_summary(error)
 
     def is_quota_error(self, error: Exception) -> bool:
         message = str(error).lower()
