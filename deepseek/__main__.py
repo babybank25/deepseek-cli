@@ -52,6 +52,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Route through all saved accounts with affinity-aware scheduling",
     )
     parser.add_argument(
+        "--routing-strategy",
+        choices=("round-robin", "fill-first", "least-used"),
+        default="round-robin",
+        help="Gateway account routing strategy (default: round-robin)",
+    )
+    parser.add_argument(
         "--admin-token",
         default=None,
         help="X-Admin-Token for /admin/* endpoints; admin routes are disabled if unset",
@@ -125,6 +131,7 @@ async def main() -> None:
             port=args.port,
             api_key=args.api_key,
             use_gateway=args.gateway,
+            routing_strategy=args.routing_strategy,
             admin_token=args.admin_token,
             auto_compact_threshold=args.auto_compact,
         )

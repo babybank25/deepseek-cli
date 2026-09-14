@@ -39,7 +39,13 @@ from .constants import (
     RETRY_BACKOFF,
     AUTO_COMPACT_THRESHOLD,
 )
-from .exceptions import AuthExpiredError, _PowExpiredError, _SessionNotFoundError
+from .exceptions import (
+    AuthExpiredError,
+    RateLimitError,
+    _PowExpiredError,
+    _SessionNotFoundError,
+    parse_retry_after_seconds,
+)
 from .models import APIConfig
 from .pow import DeepSeekHash, solve_pow_node
 
@@ -606,7 +612,10 @@ class APIClient:
             if response.status_code == 403:
                 raise AuthExpiredError("Access forbidden (403) — run /reauth")
             if response.status_code == 429:
-                raise RuntimeError("Rate limited (429) — wait a moment and try again")
+                raise RateLimitError(
+                    "Rate limited (429) — wait a moment and try again",
+                    retry_after=parse_retry_after_seconds(response.headers.get("Retry-After")),
+                )
             if 500 <= response.status_code < 600:
                 # 5xx → treat as network-class error so retry loop can recover
                 raw = await response.aread()

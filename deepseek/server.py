@@ -228,6 +228,7 @@ async def serve_mode(
     port: int = 8000,
     api_key: Optional[str] = None,
     use_gateway: bool = False,
+    routing_strategy: str = "round-robin",
     admin_token: Optional[str] = None,
     auto_compact_threshold: Optional[int] = None,
 ) -> None:
@@ -250,7 +251,7 @@ async def serve_mode(
 
     gateway_pool: Optional[AccountPool] = None
     if use_gateway:
-        gateway_pool = AccountPool()
+        gateway_pool = AccountPool(routing_strategy=routing_strategy)
         loaded = gateway_pool.load_all()
         if loaded == 0:
             console.print("[red]Gateway mode has no configured accounts.[/]")

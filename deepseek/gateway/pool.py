@@ -11,7 +11,7 @@ from typing import AsyncGenerator, Callable, Optional
 
 from ..client import APIClient
 from ..constants import CONFIG_DIR
-from ..exceptions import AuthExpiredError
+from ..exceptions import AuthExpiredError, RateLimitError
 from ..metrics import metrics
 from ..models import APIConfig
 from .account import Account
@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 Token = tuple[str, str]
 STATS_FILE = CONFIG_DIR / "pool_stats.json"
 ACQUIRE_TIMEOUT_SECONDS = 90.0
+ROUTING_STRATEGIES = {"round-robin", "fill-first", "least-used"}
 
 
 class NoAccountAvailableError(RuntimeError):
@@ -40,8 +41,17 @@ class AccountPool:
         self,
         binding_store: Optional[ConversationBindingStore] = None,
         file_store: Optional[FileAffinityStore] = None,
+        routing_strategy: str = "round-robin",
     ) -> None:
+        normalized_strategy = routing_strategy.strip().lower()
+        if normalized_strategy not in ROUTING_STRATEGIES:
+            raise ValueError(
+                f"Unsupported routing strategy '{routing_strategy}'. "
+                f"Choose one of: {', '.join(sorted(ROUTING_STRATEGIES))}."
+            )
         self._accounts: list[Account] = []
+        self.routing_strategy = normalized_strategy
+        self._last_round_robin_name: Optional[str] = None
         self._registry_lock = asyncio.Lock()
         self._last_persist_at = 0.0
         self._persist_min_interval = 5.0
@@ -168,7 +178,24 @@ class AccountPool:
             for account in self._accounts
             if account.is_available and account.name not in exclude
         ]
-        return min(candidates, key=self._score) if candidates else None
+        if not candidates:
+            return None
+        if self.routing_strategy == "least-used":
+            return min(candidates, key=self._score)
+
+        candidates.sort(key=lambda account: account.name)
+        if self.routing_strategy == "fill-first":
+            return candidates[0]
+
+        if self._last_round_robin_name is None:
+            selected = candidates[0]
+        else:
+            selected = next(
+                (account for account in candidates if account.name > self._last_round_robin_name),
+                candidates[0],
+            )
+        self._last_round_robin_name = selected.name
+        return selected
 
     def _next_account(self) -> Optional[Account]:
         return self._pick(set())
@@ -314,8 +341,15 @@ class AccountPool:
                         self._persist_stats()
                         raise
                     if account.is_quota_error(error):
-                        cooldown = account.mark_exhausted()
-                        account.last_error = str(error)[:200]
+                        retry_after = (
+                            error.retry_after
+                            if isinstance(error, RateLimitError)
+                            else None
+                        )
+                        cooldown = account.mark_exhausted(
+                            cooldown_seconds=retry_after,
+                            error=error,
+                        )
                         self._persist_stats()
                         if route_is_pinned:
                             raise NoAccountAvailableError(
@@ -449,6 +483,7 @@ class AccountPool:
             "available_accounts": sum(1 for account in snapshot if account.is_available),
             "in_use": sum(1 for account in snapshot if account.lock.locked()),
             "active_conversations": len(self._bindings),
+            "routing_strategy": self.routing_strategy,
             "accounts": [account.to_status_dict() for account in snapshot],
         }
 
